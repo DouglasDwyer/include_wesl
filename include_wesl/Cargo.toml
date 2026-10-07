@@ -1,0 +1,13 @@
+[package]
+name = "include_wesl"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+bincode.workspace = true
+include_wesl_macros.workspace = true
+naga = { workspace = true, features = [ "deserialize" ] }
+wgpu.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "include_wesl",
+    "include_wesl_macros"
+]
+
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+
+# Internal dependencies
+
+include_wesl_macros = { path = "include_wesl_macros" }
+
+# External dependencies
+
+bincode = { version = "2.0.1", default-features = false, features = [ "serde" ] }
+naga = { version = "30.0.1", default-features = false }
+rustversion = { version = "1.0.14", default-features = false }
+syn = { version = "3.0.6", default-features = false }
+wesl = { version = "0.6.0", default-features = false, features = [ "naga-ext" ] }
+wgpu = { version = "30.0.1", default-features = false, features = [ "naga-ir" ] }
+
+[patch.crates-io]
+wesl = { git = "https://github.com/DouglasDwyer/wesl-rs", rev = "14b46c15e9b83f7620fc9f58e42c75379787720f" }
+
+[workspace.lints.clippy]
+missing_docs_in_private_items = "warn"
+unwrap_used = "warn"
+
+[workspace.lints.rust]
+missing_docs = "warn"
