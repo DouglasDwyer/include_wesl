@@ -1,18 +1,10 @@
-//! Compiles `foo.wesl`, and lists what the result contains.
+//! Compiles `foo.wesl` with `include_wesl!`. To see what the macro produces, run
+//! `cargo rustc --profile=check --example demo -- -Zunpretty=expanded`.
 
 use include_wesl::*;
-use wgpu::*;
 
 /// Relative to this file, like `include_bytes!`.
+#[allow(dead_code)]
 const PACKAGE: WeslPackage = include_wesl!("foo.wesl");
 
-fn main() {
-    println!("features: {:?}", PACKAGE.features());
-
-    // Pass the source to `Device::create_shader_module`.
-    for poogie in [false, true] {
-        if let ShaderSource::Naga(module) = PACKAGE.get_source(&[("poogie", poogie)]) {
-            println!("poogie = {poogie}: {} statement(s) in main", module.entry_points[0].function.body.len());
-        }
-    }
-}
+fn main() { }
