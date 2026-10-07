@@ -1,6 +1,7 @@
 [package]
 name = "include_wesl_macros"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 
 [lib]
@@ -9,6 +10,8 @@ proc-macro = true
 [dependencies]
 bincode = { workspace = true, features = [ "alloc" ] }
 naga = { workspace = true, features = [ "serialize", "wgsl-in" ] }
+proc-macro2.workspace = true
+quote.workspace = true
 syn.workspace = true
 wesl.workspace = true
 

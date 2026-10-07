@@ -1,3 +1,5 @@
+//! Detects whether the compiler is a nightly one.
+
 /// Marks the crate as being compiled with nightly features enabled.
 #[rustversion::nightly]
 fn main() {

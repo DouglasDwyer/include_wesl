@@ -5,46 +5,72 @@
 use naga::*;
 use naga::valid::*;
 use proc_macro::*;
+use quote::quote;
 use std::collections::*;
 use std::path::*;
 use wesl::*;
 use wesl::sourcemap::*;
 
-/// Compiles the WESL shaders in a directory at build time, and expands to a
+/// The maximum number of conditional translation features that a shader may reference.
+/// A module is compiled for every combination of features, so this is a limit on build time.
+const MAX_FEATURES: usize = 16;
+
+/// Compiles the WESL shaders at a path at build time, and expands to a
 /// `WeslPackage` constant expression.
 #[proc_macro]
 pub fn include_wesl(path: TokenStream) -> TokenStream {
-    let file_path = proc_macro::Span::call_site().local_file()
-        .expect("source span not associated with file")
-        .parent()
-        .expect("source file should have parent directory")
-        .to_path_buf();
+    let requested_path = syn::parse_macro_input!(path as syn::LitStr).value();
+    let shader_path = resolve_path(&requested_path);
 
-    let requested_path = PathBuf::from(syn::parse_macro_input!(path as syn::LitStr).value());
+    let unstripped_compilation = compile_unevaluated(&shader_path);
+    let features = collect_features(&unstripped_compilation);
+    let variants = compile_variants(&shader_path, &features);
 
-    let shader_path = if requested_path.is_absolute() {
+    let tracked_files = track_files(source_files(&unstripped_compilation));
+    let serialized_variants = variants.iter()
+        .map(|module| proc_macro2::Literal::byte_string(&serialize_module(module)));
+
+    quote! {
+        {
+            #tracked_files
+
+            ::include_wesl::WeslPackage::new(
+                &[ #(#features),* ],
+                &[ #(#serialized_variants),* ]
+            )
+        }
+    }.into()
+}
+
+/// Determines the location of the shaders that were requested by the macro caller.
+/// Absolute paths are used as-is. Relative paths work like those of [`include_bytes!`]:
+/// they are relative to the file that contains the macro call.
+fn resolve_path(requested_path: &str) -> PathBuf {
+    let requested_path = PathBuf::from(requested_path);
+
+    if requested_path.is_absolute() {
         requested_path
     }
     else {
-        file_path.join(requested_path)
-    };
+        source_directory().join(requested_path)
+    }
+}
 
-    let unstripped_compilation = compile_wesl(&shader_path, Features { default: Feature::Keep, ..Default::default() });
-    let features = collect_features(&unstripped_compilation);
-    let variants = compile_variants(&shader_path, &features);
-    let serialized_variants = variants.into_iter()
-        .map(serialize_module).collect::<Vec<_>>();
+/// Gets the directory that contains the file where the macro was called.
+fn source_directory() -> PathBuf {
+    let source_file = proc_macro::Span::call_site().local_file()
+        .expect("source span not associated with file");
 
-    let to_track = track_files(source_files(&unstripped_compilation))
-        .parse::<TokenStream>()
-        .expect("failed to parse generated tokens");
-
-    
-    panic!("tt {to_track}");
+    // The path is relative to the directory that the compiler was started in.
+    std::path::absolute(source_file)
+        .expect("failed to get absolute path of source file")
+        .parent()
+        .expect("source file should have parent directory")
+        .to_path_buf()
 }
 
 /// Finds every feature mentioned in an `@if` or `@elif` condition of an unevaluated
-/// compilation.
+/// compilation. Each name is listed once, in alphabetical order.
 fn collect_features(compilation: &CompileResult) -> Vec<String> {
     use wesl::pass::*;
     use wesl::syntax::*;
@@ -57,6 +83,8 @@ fn collect_features(compilation: &CompileResult) -> Vec<String> {
         })
         .flat_map(|condition| Visit::<TypeExpression>::visit(&**condition))
         .map(|flag| flag.ident.name().to_string())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -86,9 +114,24 @@ fn compile_naga(compilation: &CompileResult) -> Module {
     module
 }
 
-/// Compiles the WESL shader package at `path`.
+/// Compiles the WESL shader package at `path`, leaving all conditional translation
+/// in place. The result is not valid WGSL, but it can be searched for feature flags.
 /// The proc macro will fail with an error if there are any issues.
-fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
+fn compile_unevaluated(path: &Path) -> CompileResult {
+    compile_wesl(path, Features { default: Feature::Keep, ..Default::default() }, false)
+}
+
+/// Compiles the WESL shader package at `path` to WGSL, where the feature flags
+/// `flags` are enabled or disabled. All other flags are an error.
+/// The proc macro will fail with an error if there are any issues.
+fn compile_variant(path: &Path, flags: HashMap<String, Feature>) -> CompileResult {
+    compile_wesl(path, Features { default: Feature::Error, flags }, true)
+}
+
+/// Compiles the WESL shader package at `path`. If `lower` is true, WESL-specific
+/// syntax is removed so that the output can be parsed as WGSL.
+/// The proc macro will fail with an error if there are any issues.
+fn compile_wesl(path: &Path, features: wesl::Features, lower: bool) -> CompileResult {
     let compiler = Compiler::new(CompileOptions {
         imports: true,
         condcomp: true,
@@ -98,7 +141,7 @@ fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
         generics: false,
         keep: None,
         keep_main: false,
-        lower: false,
+        lower,
         mangler: ManglerKind::default(),
         mangle_main: false,
         sort_declarations: false,
@@ -117,10 +160,16 @@ fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
 /// Compiles the shaders at `path` with conditional translation.
 /// A variant is generated for every possible combination of `features`.
 fn compile_variants(path: &Path, features: &[String]) -> Vec<Module> {
-    assert!(features.len() < u32::BITS as usize, "maximum number of conditional features exceeded");
+    if features.len() > MAX_FEATURES {
+        fail(format!(
+            "shader references {} conditional features ({}), but at most {MAX_FEATURES} are supported",
+            features.len(),
+            features.join(", ")
+        ));
+    }
 
     (0..(1 << features.len()))
-        .map(|enabled_mask| compile_naga(&compile_wesl(path, Features { default: Feature::Error, flags: features_xxx(enabled_mask, features) })))
+        .map(|enabled_mask| compile_naga(&compile_variant(path, variant_flags(enabled_mask, features))))
         .collect()
 }
 
@@ -132,25 +181,26 @@ fn fail(args: impl std::fmt::Display) -> ! {
     panic!();
 }
 
-fn features_xxx(enabled_mask: u32, features: &[String]) -> HashMap<String, Feature> {
-    let mut result = HashMap::default();
+/// Creates the feature flags for a shader variant. The feature at index `i`
+/// is enabled if bit `i` of `enabled_mask` is set, and disabled otherwise.
+fn variant_flags(enabled_mask: usize, features: &[String]) -> HashMap<String, Feature> {
+    features.iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let value = if (enabled_mask & (1 << i)) != 0 {
+                Feature::Enable
+            }
+            else {
+                Feature::Disable
+            };
 
-    for (i, name) in features.iter().enumerate() {
-        let value = if (enabled_mask & (1 << i)) != 0 {
-            Feature::Enable
-        }
-        else {
-            Feature::Disable
-        };
-
-        result.insert(name.clone(), value);
-    }
-
-    result
+            (name.clone(), value)
+        })
+        .collect()
 }
 
 /// Serializes the provided Naga module with [`bincode`].
-fn serialize_module(module: Module) -> Vec<u8> {
+fn serialize_module(module: &Module) -> Vec<u8> {
     bincode::serde::encode_to_vec(module, bincode::config::standard())
         .expect("failed to encode naga module")
 }
@@ -174,30 +224,75 @@ fn source_files(compilation: &CompileResult) -> Vec<PathBuf> {
 }
 
 /// Makes Cargo rebuild the caller when one of `files` changes.
-/// Returns a string that should be included in the macro output.
+/// Returns tokens that should be included in the macro output.
 #[cfg(nightly)]
-fn track_files(files: impl IntoIterator<Item = PathBuf>) -> String {
+fn track_files(files: impl IntoIterator<Item = PathBuf>) -> proc_macro2::TokenStream {
     for file in files {
         proc_macro::tracked::path(file);
     }
-    
-    String::new()
+
+    proc_macro2::TokenStream::new()
 }
 
 /// Makes Cargo rebuild the caller when one of `files` changes.
-/// Returns a string that should be included in the macro output.
+/// Returns tokens that should be included in the macro output.
 #[cfg(not(nightly))]
-fn track_files(files: impl IntoIterator<Item = PathBuf>) -> String {
-    files
+fn track_files(files: impl IntoIterator<Item = PathBuf>) -> proc_macro2::TokenStream {
+    let files = files
         .into_iter()
-        .map(|file| {
-            let file = file
-                .to_str()
-                .expect("shader path was not valid UTF-8");
-            format!(
-                "const _: &[u8] = include_bytes!({});",
-                proc_macro::Literal::string(file)
-            )
-        })
-        .collect()
+        .map(|file| file.to_str().expect("shader path was not valid UTF-8").to_string());
+
+    quote! {
+        #(const _: &[u8] = include_bytes!(#files);)*
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shaders used by the integration tests.
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../include_wesl/tests/shaders")
+    }
+
+    #[test]
+    fn variant_flags_enable_features_by_bit() {
+        let features = ["a", "b", "c"].map(String::from);
+        let flags = variant_flags(0b101, &features);
+
+        assert_eq!(flags.len(), 3);
+        assert_eq!(flags["a"], Feature::Enable);
+        assert_eq!(flags["b"], Feature::Disable);
+        assert_eq!(flags["c"], Feature::Enable);
+    }
+
+    #[test]
+    #[should_panic]
+    fn too_many_features_fail() {
+        let features = (0..=MAX_FEATURES).map(|i| format!("feature{i}")).collect::<Vec<_>>();
+        compile_variants(&fixture(), &features);
+    }
+
+    #[test]
+    fn features_are_unique_and_sorted() {
+        let compilation = compile_unevaluated(&fixture());
+        assert_eq!(collect_features(&compilation), ["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn every_file_that_is_used_is_reported() {
+        let compilation = compile_unevaluated(&fixture());
+        let names = source_files(&compilation).iter()
+            .map(|path| path.file_name().and_then(|name| name.to_str()).expect("path has a name").to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["math.wesl", "package.wesl"]);
+    }
+
+    #[test]
+    fn absolute_paths_are_not_resolved() {
+        let path = if cfg!(windows) { "C:\\shaders" } else { "/shaders" };
+        assert_eq!(resolve_path(path), Path::new(path));
+    }
 }

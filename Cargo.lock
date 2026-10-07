@@ -290,6 +290,8 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "naga",
+ "proc-macro2",
+ "quote",
  "rustversion",
  "syn 3.0.6",
  "wesl",
@@ -869,7 +871,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "wesl"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=14b46c15e9b83f7620fc9f58e42c75379787720f#14b46c15e9b83f7620fc9f58e42c75379787720f"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
 dependencies = [
  "annotate-snippets",
  "anstream",
@@ -890,12 +892,12 @@ dependencies = [
 [[package]]
 name = "wesl-core"
 version = "0.1.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=14b46c15e9b83f7620fc9f58e42c75379787720f#14b46c15e9b83f7620fc9f58e42c75379787720f"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
 
 [[package]]
 name = "wesl-macros"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=14b46c15e9b83f7620fc9f58e42c75379787720f#14b46c15e9b83f7620fc9f58e42c75379787720f"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
 dependencies = [
  "itertools",
  "proc-macro2",
@@ -1020,7 +1022,7 @@ dependencies = [
 [[package]]
 name = "wgsl-parse"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=14b46c15e9b83f7620fc9f58e42c75379787720f#14b46c15e9b83f7620fc9f58e42c75379787720f"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
 dependencies = [
  "annotate-snippets",
  "derive_more",
@@ -1036,7 +1038,7 @@ dependencies = [
 [[package]]
 name = "wgsl-types"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=14b46c15e9b83f7620fc9f58e42c75379787720f#14b46c15e9b83f7620fc9f58e42c75379787720f"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
 dependencies = [
  "half",
  "itertools",

@@ -23,11 +23,21 @@ pub struct WeslPackage {
 impl WeslPackage {
     /// Creates a new package.
     #[doc(hidden)]
-    pub fn new(features: &'static [&'static str], module_variants: &'static [&'static [u8]]) -> Self {
+    pub const fn new(
+        features: &'static [&'static str],
+        module_variants: &'static [&'static [u8]],
+    ) -> Self {
         Self {
             features,
             module_variants
         }
+    }
+
+    /// The names of the [conditional translation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md)
+    /// features that the shader references, in alphabetical order.
+    /// Each one must be passed to [`Self::get_source`].
+    pub const fn features(&self) -> &'static [&'static str] {
+        self.features
     }
 
     /// Gets the actual [`ShaderSource`] for use with [`Device::create_shader_module`].

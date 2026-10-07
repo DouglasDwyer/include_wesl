@@ -1,6 +1,7 @@
 [package]
 name = "include_wesl"
 edition.workspace = true
+rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
@@ -8,6 +9,9 @@ bincode.workspace = true
 include_wesl_macros.workspace = true
 naga = { workspace = true, features = [ "deserialize" ] }
 wgpu.workspace = true
+
+[dev-dependencies]
+naga.workspace = true
 
 [lints]
 workspace = true
