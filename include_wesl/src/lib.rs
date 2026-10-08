@@ -41,8 +41,7 @@ impl WeslPackage {
     }
 
     /// The names of the [conditional translation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md)
-    /// features that the shader references, in alphabetical order.
-    /// Each one must be passed to [`Self::get_source`].
+    /// features that the shader references. Each one must be passed to [`Self::get_source`].
     pub const fn features(&self) -> &'static [&'static str] {
         self.features
     }
@@ -57,8 +56,7 @@ impl WeslPackage {
     /// # Panics
     ///
     /// Panics if any feature names are omitted, or if the same name appears in
-    /// `features` more than once (even if the entries agree, and even if the
-    /// shader does not reference the name).
+    /// `features` more than once.
     pub fn get_source(&self, features: &[(&str, bool)]) -> ShaderSource<'static> {
         self.assert_features_unique(features);
         let index = self.module_variant_index(features);

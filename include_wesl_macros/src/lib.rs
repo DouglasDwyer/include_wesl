@@ -79,8 +79,6 @@ fn collect_features(compilation: &CompileResult) -> Vec<String> {
         })
         .flat_map(|condition| Visit::<TypeExpression>::visit(&**condition))
         .map(|flag| flag.ident.name().to_string())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect()
 }
 
