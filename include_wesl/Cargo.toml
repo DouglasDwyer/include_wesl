@@ -3,15 +3,17 @@ name = "include_wesl"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description.workspace = true
+
 
 [dependencies]
 bincode.workspace = true
 include_wesl_macros.workspace = true
 naga = { workspace = true, features = [ "deserialize" ] }
 wgpu.workspace = true
-
-[dev-dependencies]
-naga.workspace = true
 
 [lints]
 workspace = true

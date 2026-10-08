@@ -10,6 +10,12 @@ resolver = "2"
 edition = "2024"
 rust-version = "1.88"
 version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/DouglasDwyer/include_wesl"
+readme = "README.md"
+description = """
+Tiny macro to embed a WESL package with compile-time validation
+"""
 
 [workspace.dependencies]
 
@@ -19,19 +25,17 @@ include_wesl_macros = { path = "include_wesl_macros" }
 
 # External dependencies
 
-bincode = { version = "2.0.1", default-features = false, features = [ "serde" ] }
+bincode = { version = "2.0.1", default-features = false, features = [ "alloc", "serde" ] }
 naga = { version = "30.0.1", default-features = false }
 proc-macro2 = { version = "1", default-features = false }
 quote = { version = "1", default-features = false, features = [ "proc-macro" ] }
 rustversion = { version = "1.0.14", default-features = false }
 syn = { version = "3.0.6", default-features = false }
-
-# Todo: switch to next official wesl version once patched
-#wesl = { version = "0.6.0", default-features = false, features = [ "naga-ext" ] }
-wesl = { git = "https://github.com/DouglasDwyer/wesl-rs", rev = "1d4472fba421e67e5a0f7ab6edc6a73ffc30178b", default-features = false, features = [ "naga-ext" ] }
-
+wesl = { version = "0.6.0", default-features = false, features = [ "naga-ext" ] }
 wgpu = { version = "30.0.1", default-features = false, features = [ "naga-ir" ] }
 
+[patch.crates-io]
+wesl = { git = "https://github.com/DouglasDwyer/wesl-rs", rev = "1d4472fba421e67e5a0f7ab6edc6a73ffc30178b" }
 
 [workspace.lints.clippy]
 missing_docs_in_private_items = "warn"

@@ -3,21 +3,20 @@
 [![Crates.io](https://img.shields.io/crates/v/include_wesl.svg)](https://crates.io/crates/include_wesl)
 [![Docs.rs](https://docs.rs/include_wesl/badge.svg)](https://docs.rs/include_wesl)
 
-A tiny proc macro to include a [WGSL package](https://wesl-lang.dev) in your binary, and verify that it is valid at compile time.
+A tiny proc macro to include a [WESL package](https://wesl-lang.dev) in your binary, and verify that it is valid at compile time.
 
 ## Supported functionality
 
 - [Conditional compilation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md)
 - [Import statements](https://github.com/webgpu-tools/wesl-spec/blob/main/Imports.md)
 - All Naga extensions
-- Anything else that the [wesl](https://crates.io/crates/wesl) crate can compile
 
 ## Example
 
 This is how you might create a [`wgpu`](https://github.com/gfx-rs/wgpu) shader module:
 
-```rust
-let shader_package = include_wesl!("shader.wgsl");
+```rust,ignore
+let shader_package = include_wesl!("shader.wesl");
 device.create_shader_module(&ShaderModuleDescriptor {
     label: None,
     source: shader_package.get_source(&[])
@@ -48,8 +47,8 @@ fn trace_ray(position: vec3f, direction: vec3f) -> vec3f { ... }
 
 By providing the `RAYTRACING_SUPPORTED` flag when loading the shader source, it's possible to select a variant of the shader that does (or doesn't) include this method:
 
-```rust
-let shader_package = include_wesl!("shader.wgsl");
+```rust,ignore
+let shader_package = include_wesl!("shader.wesl");
 device.create_shader_module(&ShaderModuleDescriptor {
     label: None,
     source: shader_package.get_source(&[

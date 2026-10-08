@@ -193,7 +193,7 @@ fn compile_variants(path: &Path, features: &[String]) -> Vec<Module> {
 /// since normally the panic message from a proc macro gets extra indented.
 fn fail(args: impl std::fmt::Display) -> ! {
     eprintln!("\n{}\n", args);
-    panic!();
+    panic!("shader compilation failed");
 }
 
 /// Creates the feature flags for a shader variant. The feature at index `i`

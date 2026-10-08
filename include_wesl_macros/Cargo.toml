@@ -3,12 +3,16 @@ name = "include_wesl_macros"
 edition.workspace = true
 rust-version.workspace = true
 version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+description.workspace = true
 
 [lib]
 proc-macro = true
 
 [dependencies]
-bincode = { workspace = true, features = [ "alloc" ] }
+bincode.workspace = true
 naga = { workspace = true, features = [ "serialize", "wgsl-in" ] }
 proc-macro2.workspace = true
 quote.workspace = true

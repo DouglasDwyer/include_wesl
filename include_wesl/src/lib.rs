@@ -28,6 +28,11 @@ impl WeslPackage {
         features: &'static [&'static str],
         module_variants: &'static [&'static [u8]],
     ) -> Self {
+        assert!(
+            module_variants.len() == 1 << features.len(),
+            "variant list size not equal to total variant combinations"
+        );
+
         Self {
             features,
             module_variants,
