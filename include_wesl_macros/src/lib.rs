@@ -38,40 +38,13 @@ pub fn include_wesl(path: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Determines the location of the shaders that were requested by the macro
-/// caller. Absolute paths are used as-is. Relative paths work like those of
-/// [`include_bytes!`]: they are relative to the file that contains the macro
-/// call.
-fn resolve_path(requested_path: &str) -> PathBuf {
-    let requested_path = PathBuf::from(requested_path);
-
-    if requested_path.is_absolute() {
-        requested_path
-    } else {
-        source_directory().join(requested_path)
-    }
-}
-
-/// Gets the directory that contains the file where the macro was called.
-/// The path is relative to the directory that the compiler was started in, if
-/// the compiler gave a relative path. That keeps the paths in error messages
-/// short.
-fn source_directory() -> PathBuf {
-    proc_macro::Span::call_site()
-        .local_file()
-        .expect("source span not associated with file")
-        .parent()
-        .expect("source file should have parent directory")
-        .to_path_buf()
-}
-
 /// Finds every feature mentioned in an `@if` or `@elif` condition of an
-/// unevaluated compilation. Each name is listed once, in alphabetical order.
+/// unevaluated compilation. Each name is listed exactly once.
 fn collect_features(compilation: &CompileResult) -> Vec<String> {
     use wesl::pass::*;
     use wesl::syntax::*;
 
-    Visit::<Attributes>::visit(compilation.syntax())
+    let mut result = Visit::<Attributes>::visit(compilation.syntax())
         .flatten()
         .filter_map(|attribute| match &**attribute {
             Attribute::If(condition) | Attribute::Elif(condition) => Some(condition),
@@ -79,7 +52,12 @@ fn collect_features(compilation: &CompileResult) -> Vec<String> {
         })
         .flat_map(|condition| Visit::<TypeExpression>::visit(&**condition))
         .map(|flag| flag.ident.name().to_string())
-        .collect()
+        .collect::<Vec<_>>();
+
+    result.sort();
+    result.dedup();
+
+    result
 }
 
 /// Takes the WGSL output and converts it to a Naga module.
@@ -194,22 +172,31 @@ fn fail(args: impl std::fmt::Display) -> ! {
     panic!("shader compilation failed");
 }
 
-/// Creates the feature flags for a shader variant. The feature at index `i`
-/// is enabled if bit `i` of `enabled_mask` is set, and disabled otherwise.
-fn variant_flags(enabled_mask: u32, features: &[String]) -> HashMap<String, Feature> {
-    features
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            let value = if (enabled_mask & (1 << i)) != 0 {
-                Feature::Enable
-            } else {
-                Feature::Disable
-            };
+/// Determines the location of the shaders that were requested by the macro
+/// caller. Absolute paths are used as-is. Relative paths work like those of
+/// [`include_bytes!`]: they are relative to the file that contains the macro
+/// call.
+fn resolve_path(requested_path: &str) -> PathBuf {
+    let requested_path = PathBuf::from(requested_path);
 
-            (name.clone(), value)
-        })
-        .collect()
+    if requested_path.is_absolute() {
+        requested_path
+    } else {
+        source_directory().join(requested_path)
+    }
+}
+
+/// Gets the directory that contains the file where the macro was called.
+/// The path is relative to the directory that the compiler was started in, if
+/// the compiler gave a relative path. That keeps the paths in error messages
+/// short.
+fn source_directory() -> PathBuf {
+    proc_macro::Span::call_site()
+        .local_file()
+        .expect("source span not associated with file")
+        .parent()
+        .expect("source file should have parent directory")
+        .to_path_buf()
 }
 
 /// Serializes the provided Naga module with [`bincode`].
@@ -259,6 +246,24 @@ fn track_files(files: impl IntoIterator<Item = PathBuf>) -> proc_macro2::TokenSt
     quote::quote! {
         #(const _: &[u8] = include_bytes!(#files);)*
     }
+}
+
+/// Creates the feature flags for a shader variant. The feature at index `i`
+/// is enabled if bit `i` of `enabled_mask` is set, and disabled otherwise.
+fn variant_flags(enabled_mask: u32, features: &[String]) -> HashMap<String, Feature> {
+    features
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let value = if (enabled_mask & (1 << i)) != 0 {
+                Feature::Enable
+            } else {
+                Feature::Disable
+            };
+
+            (name.clone(), value)
+        })
+        .collect()
 }
 
 /// Tests for the helper functions of the macro.
