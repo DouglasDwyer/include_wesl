@@ -1,4 +1,4 @@
-#![doc = include_str!("../../README.md")]
+#![doc = include_str!("../README.md")]
 #![cfg_attr(nightly, feature(proc_macro_tracked_path))]
 
 use naga::valid::*;
