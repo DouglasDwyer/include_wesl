@@ -1,4 +1,5 @@
-//! Tests that compile the shaders in `shaders` with the macro, and then use the result.
+//! Tests that compile the shaders in `shaders` with the macro, and then use the
+//! result.
 
 use include_wesl::*;
 use naga::{Expression, Literal, Module};
@@ -7,7 +8,8 @@ use wgpu::ShaderSource;
 /// Relative to this file, like `include_bytes!`.
 const DIRECTORY: WeslPackage = include_wesl!("shaders");
 
-/// The same shaders, but with the main module specified instead of the directory.
+/// The same shaders, but with the main module specified instead of the
+/// directory.
 const FILE: WeslPackage = include_wesl!("shaders/package.wesl");
 
 /// Usable in constants.
@@ -21,7 +23,8 @@ fn module(package: WeslPackage, features: &[(&str, bool)]) -> Module {
     }
 }
 
-/// Determines whether any function in the module uses the `u32` literal `value`.
+/// Determines whether any function in the module uses the `u32` literal
+/// `value`.
 fn has_literal(module: &Module, value: u32) -> bool {
     module
         .functions
@@ -32,7 +35,8 @@ fn has_literal(module: &Module, value: u32) -> bool {
         .any(|(_, expression)| *expression == Expression::Literal(Literal::U32(value)))
 }
 
-/// A feature that is mentioned several times, in different kinds of places, is listed once.
+/// A feature that is mentioned several times, in different kinds of places, is
+/// listed once.
 #[test]
 fn features_are_unique_and_sorted() {
     assert_eq!(FEATURES, ["alpha", "beta", "gamma"]);
@@ -44,21 +48,34 @@ fn file_and_directory_find_the_same_features() {
     assert_eq!(FILE.features(), DIRECTORY.features());
 }
 
-/// Each combination of features compiles to a module that has the matching code and no other.
+/// Each combination of features compiles to a module that has the matching code
+/// and no other.
 #[test]
 fn every_combination_of_features_gets_its_own_module() {
     for package in [DIRECTORY, FILE] {
         for mask in 0..8 {
             let [alpha, beta, gamma] = [0, 1, 2].map(|bit| mask & (1 << bit) != 0);
-            let module = module(package, &[("alpha", alpha), ("beta", beta), ("gamma", gamma)]);
+            let module = module(
+                package,
+                &[("alpha", alpha), ("beta", beta), ("gamma", gamma)],
+            );
 
             assert!(module.entry_points.iter().any(|entry| entry.name == "main"));
             assert_eq!(
-                module.functions.iter().any(|(_, function)| function.name.as_deref() == Some("alpha_enabled")),
+                module
+                    .functions
+                    .iter()
+                    .any(|(_, function)| function.name.as_deref() == Some("alpha_enabled")),
                 alpha
             );
-            assert_eq!((has_literal(&module, 7), has_literal(&module, 8)), (beta, !beta));
-            assert_eq!((has_literal(&module, 1000), has_literal(&module, 2000)), (gamma, !gamma));
+            assert_eq!(
+                (has_literal(&module, 7), has_literal(&module, 8)),
+                (beta, !beta)
+            );
+            assert_eq!(
+                (has_literal(&module, 1000), has_literal(&module, 2000)),
+                (gamma, !gamma)
+            );
         }
     }
 }
@@ -68,7 +85,13 @@ fn every_combination_of_features_gets_its_own_module() {
 fn unknown_and_repeated_features_are_ignored() {
     let module = module(
         DIRECTORY,
-        &[("other", true), ("alpha", false), ("beta", true), ("gamma", true), ("other", false)],
+        &[
+            ("other", true),
+            ("alpha", false),
+            ("beta", true),
+            ("gamma", true),
+            ("other", false),
+        ],
     );
     assert!(has_literal(&module, 7));
     assert!(has_literal(&module, 1000));
