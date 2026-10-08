@@ -1,6 +1,6 @@
 #![doc = include_str!("../../README.md")]
 
-pub use include_wesl_macros::include_wesl;
+pub use include_wesl_macros::*;
 use std::borrow::*;
 use wgpu::*;
 

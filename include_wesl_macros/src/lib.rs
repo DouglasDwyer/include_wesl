@@ -5,7 +5,6 @@
 use naga::*;
 use naga::valid::*;
 use proc_macro::*;
-use quote::quote;
 use std::collections::*;
 use std::path::*;
 use wesl::*;
@@ -26,7 +25,7 @@ pub fn include_wesl(path: TokenStream) -> TokenStream {
     let serialized_variants = variants.iter()
         .map(|module| proc_macro2::Literal::byte_string(&serialize_module(module)));
 
-    quote! {
+    quote::quote! {
         {
             #tracked_files
 
@@ -230,7 +229,7 @@ fn track_files(files: impl IntoIterator<Item = PathBuf>) -> proc_macro2::TokenSt
         .into_iter()
         .map(|file| file.to_str().expect("shader path was not valid UTF-8").to_string());
 
-    quote! {
+    quote::quote! {
         #(const _: &[u8] = include_bytes!(#files);)*
     }
 }

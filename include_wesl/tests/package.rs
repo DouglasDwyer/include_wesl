@@ -2,8 +2,8 @@
 //! result.
 
 use include_wesl::*;
-use naga::{Expression, Literal, Module};
-use wgpu::ShaderSource;
+use naga::*;
+use wgpu::*;
 
 /// Relative to this file, like `include_bytes!`.
 const DIRECTORY: WeslPackage = include_wesl!("shaders");
