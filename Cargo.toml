@@ -25,11 +25,13 @@ proc-macro2 = { version = "1", default-features = false }
 quote = { version = "1", default-features = false, features = [ "proc-macro" ] }
 rustversion = { version = "1.0.14", default-features = false }
 syn = { version = "3.0.6", default-features = false }
-wesl = { version = "0.6.0", default-features = false, features = [ "naga-ext" ] }
+
+# Todo: switch to next official wesl version once patched
+#wesl = { version = "0.6.0", default-features = false, features = [ "naga-ext" ] }
+wesl = { git = "https://github.com/DouglasDwyer/wesl-rs", rev = "1d4472fba421e67e5a0f7ab6edc6a73ffc30178b", default-features = false, features = [ "naga-ext" ] }
+
 wgpu = { version = "30.0.1", default-features = false, features = [ "naga-ir" ] }
 
-[patch.crates-io]
-wesl = { git = "https://github.com/DouglasDwyer/wesl-rs", rev = "1d4472fba421e67e5a0f7ab6edc6a73ffc30178b" }
 
 [workspace.lints.clippy]
 missing_docs_in_private_items = "warn"
