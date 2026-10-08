@@ -1,49 +1,59 @@
 # include_wesl
 
-Compile, check and embed [WESL](https://wesl-lang.dev) shaders when your crate is built.
+[![Crates.io](https://img.shields.io/crates/v/include_wesl.svg)](https://crates.io/crates/include_wesl)
+[![Docs.rs](https://docs.rs/include_wesl/badge.svg)](https://docs.rs/include_wesl)
 
-```rust,ignore
-use include_wesl::*;
+A tiny proc macro to include a [WGSL package](https://wesl-lang.dev) in your binary, and verify that it is valid at compile time.
 
-const SHADERS: WeslPackage = include_wesl!("shaders/package.wesl");
+## Supported functionality
 
-// Pass a value for every feature that the shaders mention...
-let source = SHADERS.get_source(&[("high_quality", true), ("debug", false)]);
+- [Conditional compilation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md)
+- [Import statements](https://github.com/webgpu-tools/wesl-spec/blob/main/Imports.md)
+- All Naga extensions
+- Anything else that the [wesl](https://crates.io/crates/wesl) crate can compile
 
-// ...and create a module from the result.
-let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-    label: Some("shaders"),
-    source,
-});
+## Example
+
+This is how you might create a [`wgpu`](https://github.com/gfx-rs/wgpu) shader module:
+
+```rust
+let shader_package = include_wesl!("shader.wgsl");
+device.create_shader_module(&ShaderModuleDescriptor {
+    label: None,
+    source: shader_package.get_source(&[])
+})
 ```
 
-## How it works
+The macro will make sure at compile time that your WESL code is valid using [`naga`](https://crates.io/crates/naga). Otherwise, you will get a friendly error message:
 
-`include_wesl!` runs the WESL compiler inside the macro, so a shader with an error is a compile error,
-and nothing has to be compiled when the program runs. WESL imports are followed, and each file that is read
-is registered with Cargo so that changing it rebuilds the crate. The argument is a string literal for either
+```text
+error: no definition in scope for identifier: `bazz`
+ --> examples/foo.wesl:6:5
+  |
+6 | /     @if(some_feature)
+7 | |     bazz(workgroup_id.x);
+  | |_________________________^ unknown identifier
+```
 
-* the directory of a WESL package, which must contain a `package.wesl`, or
-* the main WESL file, in which case its directory is the root of the package.
+See [the examples directory](./examples) for a full demo.
 
-A relative path is relative to the file that contains the macro call, like the path of `include_bytes!`,
-and an absolute path is used as it is.
+#### Conditional compilation
 
-### Features
+[WESL supports annotating sections of code with `@if`, `@elif`, and `@else`](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md), similar to the `#[cfg(feature = "")]` syntax in Rust. This crate allows for providing a list of features to enable _at runtime_. This is useful, for example, to enable features only supported on certain GPUs:
 
-Every name that is used in an `@if` or `@elif` condition of a shader is a
-[conditional translation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md)
-feature. Features are not tied to anything else, so they can stand for whatever the shaders and the program agree on:
-a GPU capability, a quality setting, a debug mode.
+```wgsl
+@if(RAYTRACING_SUPPORTED)
+fn trace_ray(position: vec3f, direction: vec3f) -> vec3f { ... }
+```
 
-Which features are enabled is not known until the program runs, so the macro compiles and validates a module for every
-combination of features. `WeslPackage::get_source` picks one when it is called, and only that module is deserialized.
-Because the number of modules doubles with every feature, a shader may mention at most 31 of them.
+By providing the `RAYTRACING_SUPPORTED` flag when loading the shader source, it's possible to select a variant of the shader that does (or doesn't) include this method:
 
-`WeslPackage::features` lists the names that the shaders mention, and `WeslPackage::get_source` needs a value for
-each of them.
-
-## Compiler support
-
-A stable compiler of version 1.88 or later works. A nightly compiler is better: it lets the macro tell Cargo about the
-shader files directly (`proc_macro_tracked_path`), instead of by including their bytes into an unused constant.
+```rust
+let shader_package = include_wesl!("shader.wgsl");
+device.create_shader_module(&ShaderModuleDescriptor {
+    label: None,
+    source: shader_package.get_source(&[
+        ("RAYTRACING_SUPPORTED", device.features().contains(Feature::EXPERIMENTAL_RAY_QUERY))
+    ])
+})
+```

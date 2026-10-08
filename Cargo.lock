@@ -329,31 +329,6 @@ name = "lalrpop-util"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "884f3e747ed2dcee867cda1b0c31a048f9e20de2d916a248949319921a2e666e"
-dependencies = [
- "regex-automata",
-]
-
-[[package]]
-name = "lexical"
-version = "7.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bc8a009b2ff1f419ccc62706f04fe0ca6e67b37460513964a3dfdb919bb37d6"
-dependencies = [
- "lexical-core",
-]
-
-[[package]]
-name = "lexical-core"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d8d125a277f807e55a77304455eb7b1cb52f2b18c143b60e766c120bd64a594"
-dependencies = [
- "lexical-parse-float",
- "lexical-parse-integer",
- "lexical-util",
- "lexical-write-float",
- "lexical-write-integer",
-]
 
 [[package]]
 name = "lexical-parse-float"
@@ -379,25 +354,6 @@ name = "lexical-util"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2604dd126bb14f13fb5d1bd6a66155079cb9fa655b37f875b3a742c705dbed17"
-
-[[package]]
-name = "lexical-write-float"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50c438c87c013188d415fbabbb1dceb44249ab81664efbd31b14ae55dabb6361"
-dependencies = [
- "lexical-util",
- "lexical-write-integer",
-]
-
-[[package]]
-name = "lexical-write-integer"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "409851a618475d2d5796377cad353802345cba92c867d9fbcde9cf4eac4e14df"
-dependencies = [
- "lexical-util",
-]
 
 [[package]]
 name = "libc"
@@ -871,15 +827,13 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 [[package]]
 name = "wesl"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=1d4472fba421e67e5a0f7ab6edc6a73ffc30178b#1d4472fba421e67e5a0f7ab6edc6a73ffc30178b"
 dependencies = [
  "annotate-snippets",
  "anstream",
  "derive_more",
  "glob",
- "half",
  "itertools",
- "num-traits",
  "serde",
  "thiserror",
  "toml",
@@ -892,12 +846,12 @@ dependencies = [
 [[package]]
 name = "wesl-core"
 version = "0.1.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=1d4472fba421e67e5a0f7ab6edc6a73ffc30178b#1d4472fba421e67e5a0f7ab6edc6a73ffc30178b"
 
 [[package]]
 name = "wesl-macros"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=1d4472fba421e67e5a0f7ab6edc6a73ffc30178b#1d4472fba421e67e5a0f7ab6edc6a73ffc30178b"
 dependencies = [
  "itertools",
  "proc-macro2",
@@ -1022,13 +976,14 @@ dependencies = [
 [[package]]
 name = "wgsl-parse"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=1d4472fba421e67e5a0f7ab6edc6a73ffc30178b#1d4472fba421e67e5a0f7ab6edc6a73ffc30178b"
 dependencies = [
  "annotate-snippets",
  "derive_more",
  "itertools",
  "lalrpop-util",
- "lexical",
+ "lexical-parse-float",
+ "lexical-parse-integer",
  "logos",
  "pretty",
  "thiserror",
@@ -1038,7 +993,7 @@ dependencies = [
 [[package]]
 name = "wgsl-types"
 version = "0.6.0"
-source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=77392d0f903e18e6d75b876e7e2cea31867a35f6#77392d0f903e18e6d75b876e7e2cea31867a35f6"
+source = "git+https://github.com/DouglasDwyer/wesl-rs?rev=1d4472fba421e67e5a0f7ab6edc6a73ffc30178b#1d4472fba421e67e5a0f7ab6edc6a73ffc30178b"
 dependencies = [
  "half",
  "itertools",
