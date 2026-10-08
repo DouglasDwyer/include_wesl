@@ -20,6 +20,7 @@ pub struct WeslPackage {
     module_variants: &'static [&'static [u8]]
 }
 
+/// Creating packages, and getting the shaders out of them.
 impl WeslPackage {
     /// Creates a new package.
     #[doc(hidden)]

@@ -7,4 +7,5 @@ use include_wesl::*;
 #[allow(dead_code)]
 const PACKAGE: WeslPackage = include_wesl!("foo.wesl");
 
+/// The demo has nothing to run. The interesting part is the expansion of `PACKAGE`.
 fn main() { }

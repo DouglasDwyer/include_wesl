@@ -38,7 +38,7 @@ a GPU capability, a quality setting, a debug mode.
 
 Which features are enabled is not known until the program runs, so the macro compiles and validates a module for every
 combination of features. `WeslPackage::get_source` picks one when it is called, and only that module is deserialized.
-Because the number of modules doubles with every feature, a shader may mention at most 16 of them.
+Because the number of modules doubles with every feature, a shader may mention at most 31 of them.
 
 `WeslPackage::features` lists the names that the shaders mention, and `WeslPackage::get_source` needs a value for
 each of them.

@@ -11,10 +11,6 @@ use std::path::*;
 use wesl::*;
 use wesl::sourcemap::*;
 
-/// The maximum number of conditional translation features that a shader may reference.
-/// A module is compiled for every combination of features, so this is a limit on build time.
-const MAX_FEATURES: usize = 16;
-
 /// Compiles the WESL shaders at a path at build time, and expands to a
 /// `WeslPackage` constant expression.
 #[proc_macro]
@@ -160,13 +156,7 @@ fn compile_wesl(path: &Path, features: wesl::Features, lower: bool) -> CompileRe
 /// Compiles the shaders at `path` with conditional translation.
 /// A variant is generated for every possible combination of `features`.
 fn compile_variants(path: &Path, features: &[String]) -> Vec<Module> {
-    if features.len() > MAX_FEATURES {
-        fail(format!(
-            "shader references {} conditional features ({}), but at most {MAX_FEATURES} are supported",
-            features.len(),
-            features.join(", ")
-        ));
-    }
+    assert!(features.len() < u32::BITS as usize, "maximum number of conditional features exceeded");
 
     (0..(1 << features.len()))
         .map(|enabled_mask| compile_naga(&compile_variant(path, variant_flags(enabled_mask, features))))
@@ -183,7 +173,7 @@ fn fail(args: impl std::fmt::Display) -> ! {
 
 /// Creates the feature flags for a shader variant. The feature at index `i`
 /// is enabled if bit `i` of `enabled_mask` is set, and disabled otherwise.
-fn variant_flags(enabled_mask: usize, features: &[String]) -> HashMap<String, Feature> {
+fn variant_flags(enabled_mask: u32, features: &[String]) -> HashMap<String, Feature> {
     features.iter()
         .enumerate()
         .map(|(i, name)| {
@@ -247,6 +237,7 @@ fn track_files(files: impl IntoIterator<Item = PathBuf>) -> proc_macro2::TokenSt
     }
 }
 
+/// Tests for the helper functions of the macro.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +247,7 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../include_wesl/tests/shaders")
     }
 
+    /// Bit `i` of the mask enables the feature at index `i`.
     #[test]
     fn variant_flags_enable_features_by_bit() {
         let features = ["a", "b", "c"].map(String::from);
@@ -267,19 +259,22 @@ mod tests {
         assert_eq!(flags["c"], Feature::Enable);
     }
 
+    /// A mask has to be able to hold one bit for every feature.
     #[test]
-    #[should_panic]
+    #[should_panic(expected = "maximum number of conditional features exceeded")]
     fn too_many_features_fail() {
-        let features = (0..=MAX_FEATURES).map(|i| format!("feature{i}")).collect::<Vec<_>>();
+        let features = (0..u32::BITS).map(|i| format!("feature{i}")).collect::<Vec<_>>();
         compile_variants(&fixture(), &features);
     }
 
+    /// A feature that is mentioned several times, in different kinds of places, is listed once.
     #[test]
     fn features_are_unique_and_sorted() {
         let compilation = compile_unevaluated(&fixture());
         assert_eq!(collect_features(&compilation), ["alpha", "beta", "gamma"]);
     }
 
+    /// Imported files are tracked, along with the main one.
     #[test]
     fn every_file_that_is_used_is_reported() {
         let compilation = compile_unevaluated(&fixture());
@@ -290,6 +285,7 @@ mod tests {
         assert_eq!(names, ["math.wesl", "package.wesl"]);
     }
 
+    /// Only relative paths depend on the file that the macro is called from.
     #[test]
     fn absolute_paths_are_not_resolved() {
         let path = if cfg!(windows) { "C:\\shaders" } else { "/shaders" };

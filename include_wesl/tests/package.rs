@@ -32,16 +32,19 @@ fn has_literal(module: &Module, value: u32) -> bool {
         .any(|(_, expression)| *expression == Expression::Literal(Literal::U32(value)))
 }
 
+/// A feature that is mentioned several times, in different kinds of places, is listed once.
 #[test]
 fn features_are_unique_and_sorted() {
     assert_eq!(FEATURES, ["alpha", "beta", "gamma"]);
 }
 
+/// Naming the main file is the same as naming its directory.
 #[test]
 fn file_and_directory_find_the_same_features() {
     assert_eq!(FILE.features(), DIRECTORY.features());
 }
 
+/// Each combination of features compiles to a module that has the matching code and no other.
 #[test]
 fn every_combination_of_features_gets_its_own_module() {
     for package in [DIRECTORY, FILE] {
@@ -60,6 +63,7 @@ fn every_combination_of_features_gets_its_own_module() {
     }
 }
 
+/// Extra entries in the features that are passed to `get_source` do not matter.
 #[test]
 fn unknown_and_repeated_features_are_ignored() {
     let module = module(
@@ -70,6 +74,7 @@ fn unknown_and_repeated_features_are_ignored() {
     assert!(has_literal(&module, 1000));
 }
 
+/// There is no default for a feature that is left out.
 #[test]
 #[should_panic(expected = "feature `beta` was not provided")]
 fn omitted_features_panic() {
