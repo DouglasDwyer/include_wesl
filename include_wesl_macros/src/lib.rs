@@ -53,13 +53,11 @@ fn resolve_path(requested_path: &str) -> PathBuf {
 }
 
 /// Gets the directory that contains the file where the macro was called.
+/// The path is relative to the directory that the compiler was started in, if the
+/// compiler gave a relative path. That keeps the paths in error messages short.
 fn source_directory() -> PathBuf {
-    let source_file = proc_macro::Span::call_site().local_file()
-        .expect("source span not associated with file");
-
-    // The path is relative to the directory that the compiler was started in.
-    std::path::absolute(source_file)
-        .expect("failed to get absolute path of source file")
+    proc_macro::Span::call_site().local_file()
+        .expect("source span not associated with file")
         .parent()
         .expect("source file should have parent directory")
         .to_path_buf()
