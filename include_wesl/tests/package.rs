@@ -82,7 +82,7 @@ fn every_combination_of_features_gets_its_own_module() {
 
 /// Extra entries in the features that are passed to `get_source` do not matter.
 #[test]
-fn unknown_and_repeated_features_are_ignored() {
+fn unknown_features_are_ignored() {
     let module = module(
         DIRECTORY,
         &[
@@ -90,11 +90,36 @@ fn unknown_and_repeated_features_are_ignored() {
             ("alpha", false),
             ("beta", true),
             ("gamma", true),
-            ("other", false),
         ],
     );
     assert!(has_literal(&module, 7));
     assert!(has_literal(&module, 1000));
+}
+
+/// A feature that is listed twice is an error, even if the two entries agree.
+#[test]
+#[should_panic(expected = "duplicate feature name `alpha`")]
+fn repeated_features_panic() {
+    let _ = DIRECTORY.get_source(&[
+        ("alpha", true),
+        ("beta", true),
+        ("gamma", true),
+        ("alpha", true),
+    ]);
+}
+
+/// A feature that is listed twice is an error, even if the shaders never use
+/// it.
+#[test]
+#[should_panic(expected = "duplicate feature name `other`")]
+fn repeated_unknown_features_panic() {
+    let _ = DIRECTORY.get_source(&[
+        ("alpha", true),
+        ("beta", true),
+        ("gamma", true),
+        ("other", true),
+        ("other", false),
+    ]);
 }
 
 /// There is no default for a feature that is left out.

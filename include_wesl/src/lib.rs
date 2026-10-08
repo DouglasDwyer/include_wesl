@@ -52,7 +52,13 @@ impl WeslPackage {
     ///
     /// The list of `features` determines what gets enabled from [conditional translation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md).
     /// All features referenced by the shader must be provided, both enabled and
-    /// disabled. This function will panic if any feature names are omitted.
+    /// disabled. Names that the shader does not reference are ignored.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any feature names are omitted, or if the same name appears in
+    /// `features` more than once (even if the entries agree, and even if the
+    /// shader does not reference the name).
     pub fn get_source(&self, features: &[(&str, bool)]) -> ShaderSource<'static> {
         self.assert_features_unique(features);
         let index = self.module_variant_index(features);
