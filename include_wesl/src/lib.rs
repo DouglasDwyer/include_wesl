@@ -2,6 +2,7 @@
 
 pub use include_wesl_macros::*;
 use std::borrow::*;
+use std::collections::*;
 use wgpu::*;
 
 /// Holds a compiled shader module (and all of its variants).
@@ -53,6 +54,7 @@ impl WeslPackage {
     /// All features referenced by the shader must be provided, both enabled and
     /// disabled. This function will panic if any feature names are omitted.
     pub fn get_source(&self, features: &[(&str, bool)]) -> ShaderSource<'static> {
+        self.assert_features_unique(features);
         let index = self.module_variant_index(features);
         let (module, _) = bincode::serde::decode_from_slice(
             self.module_variants[index],
@@ -60,6 +62,17 @@ impl WeslPackage {
         )
         .expect("failed to decode module");
         ShaderSource::Naga(Cow::Owned(module))
+    }
+
+    /// Checks that there are no duplicate entries in `features`. Otherwise, panics.
+    fn assert_features_unique(&self, features: &[(&str, bool)]) {
+        let mut accumulator = HashSet::new();
+
+        for (feature, _) in features {
+            if !accumulator.insert(feature) {
+                panic!("duplicate feature name `{feature}`");
+            }
+        }
     }
 
     /// Determines which module variant to use based upon the enabled features.

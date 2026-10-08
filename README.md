@@ -34,7 +34,7 @@ error: no definition in scope for identifier: `bazz`
   | |_________________________^ unknown identifier
 ```
 
-See [the examples directory](./examples) for a full demo.
+See the examples directory for a full demo.
 
 #### Conditional compilation
 
@@ -52,7 +52,7 @@ let shader_package = include_wesl!("shader.wesl");
 device.create_shader_module(&ShaderModuleDescriptor {
     label: None,
     source: shader_package.get_source(&[
-        ("RAYTRACING_SUPPORTED", device.features().contains(Feature::EXPERIMENTAL_RAY_QUERY))
+        ("RAYTRACING_SUPPORTED", device.features().contains(Features::EXPERIMENTAL_RAY_QUERY))
     ])
 })
 ```
