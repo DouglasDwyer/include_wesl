@@ -28,7 +28,7 @@ The macro will make sure at compile time that your WESL code is valid using [`na
 
 ```text
 error: no definition in scope for identifier: `bazz`
- --> examples/foo.wesl:6:5
+ --> include_wesl/examples/foo.wesl:6:5
   |
 6 | /     @if(some_feature)
 7 | |     bazz(workgroup_id.x);
