@@ -99,7 +99,6 @@ fn compile_unevaluated(path: &Path) -> CompileResult {
             default: Feature::Keep,
             ..Default::default()
         },
-        false,
     )
 }
 
@@ -113,14 +112,17 @@ fn compile_variant(path: &Path, flags: HashMap<String, Feature>) -> CompileResul
             default: Feature::Error,
             flags,
         },
-        true,
     )
 }
 
-/// Compiles the WESL shader package at `path`. If `lower` is true,
-/// WESL-specific syntax is removed so that the output can be parsed as WGSL.
+/// Compiles the WESL shader package at `path`.
 /// The proc macro will fail with an error if there are any issues.
-fn compile_wesl(path: &Path, features: wesl::Features, lower: bool) -> CompileResult {
+///
+/// WESL's lowering pass is deliberately disabled. Linking and name mangling already
+/// produce valid WGSL, and Naga natively handles the `const` and `alias` declarations
+/// that lowering would otherwise inline by rewriting identifiers into source text
+/// (which drops the declared type of `const`s and has been order-dependent).
+fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
     let compiler = Compiler::new(CompileOptions {
         imports: true,
         condcomp: true,
@@ -130,7 +132,7 @@ fn compile_wesl(path: &Path, features: wesl::Features, lower: bool) -> CompileRe
         generics: false,
         keep: None,
         keep_main: false,
-        lower,
+        lower: false,
         mangler: ManglerKind::default(),
         mangle_main: false,
         sort_declarations: false,
