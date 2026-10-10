@@ -88,6 +88,19 @@ fn compile_naga(compilation: &CompileResult) -> Module {
     module
 }
 
+/// Compiles the WESL shader package at `path` to WGSL, where the feature flags
+/// `flags` are enabled or disabled. All other flags are an error.
+/// The proc macro will fail with an error if there are any issues.
+fn compile_variant(path: &Path, flags: HashMap<String, Feature>) -> CompileResult {
+    compile_wesl(
+        path,
+        Features {
+            default: Feature::Error,
+            flags,
+        },
+    )
+}
+
 /// Compiles the WESL shader package at `path`, leaving all conditional
 /// translation in place. The result is not valid WGSL, but it can be searched
 /// for feature flags. The proc macro will fail with an error if there are any
@@ -99,28 +112,13 @@ fn compile_unevaluated(path: &Path) -> CompileResult {
             default: Feature::Keep,
             ..Default::default()
         },
-        false,
-    )
-}
-
-/// Compiles the WESL shader package at `path` to WGSL, where the feature flags
-/// `flags` are enabled or disabled. All other flags are an error.
-/// The proc macro will fail with an error if there are any issues.
-fn compile_variant(path: &Path, flags: HashMap<String, Feature>) -> CompileResult {
-    compile_wesl(
-        path,
-        Features {
-            default: Feature::Error,
-            flags,
-        },
-        true,
     )
 }
 
 /// Compiles the WESL shader package at `path`. If `lower` is true,
 /// WESL-specific syntax is removed so that the output can be parsed as WGSL.
 /// The proc macro will fail with an error if there are any issues.
-fn compile_wesl(path: &Path, features: wesl::Features, lower: bool) -> CompileResult {
+fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
     let compiler = Compiler::new(CompileOptions {
         imports: true,
         condcomp: true,
@@ -130,7 +128,7 @@ fn compile_wesl(path: &Path, features: wesl::Features, lower: bool) -> CompileRe
         generics: false,
         keep: None,
         keep_main: false,
-        lower,
+        lower: false,
         mangler: ManglerKind::default(),
         mangle_main: false,
         sort_declarations: false,
