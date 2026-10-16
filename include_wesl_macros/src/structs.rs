@@ -1141,3 +1141,400 @@ fn doc_comments(source: &str, start: usize) -> Vec<String> {
     docs.reverse();
     docs
 }
+
+/// Tests for the helper functions of the macro.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The predeclared aliases are understood.
+    #[test]
+    fn test_aliases() {
+        assert_eq!(parse_vector_alias("vec3f"), Some((3, Prim::F32)));
+        assert_eq!(parse_vector_alias("vec2u"), Some((2, Prim::U32)));
+        assert_eq!(parse_vector_alias("vec4"), None);
+        assert_eq!(parse_matrix_alias("mat4x3h"), Some((4, 3, Prim::F16)));
+        assert_eq!(parse_matrix_alias("mat4x3"), None);
+    }
+
+    /// By default, vectors and matrices are arrays, and three-row matrices
+    /// in blittable structs expose the padding of their columns.
+    #[test]
+    fn test_arrays_are_used_by_default() {
+        let mut options = fixture_options();
+        options.vector_types = VectorTypes::Array;
+        let output = generate_fixture(&options);
+
+        assert!(!output.contains("glam::Vec"));
+        assert!(!output.contains("glam::Mat"));
+        assert!(output.contains("pubmin:[f32;3usize]"));
+        assert!(output.contains("pubview_projection:[[f32;4usize];4usize]"));
+        assert!(output.contains("pubbasis:[[f32;4usize];3usize]"));
+        assert!(output.contains("pubids:[u32;2usize]"));
+    }
+
+    /// Structs are `Pod` whenever their layout allows it.
+    #[test]
+    fn test_blittable_structs_derive_pod() {
+        let output = generate_package(
+            "blittable",
+            &[("package.wesl", "@export struct A { x: u32, y: vec2f }")],
+            &[],
+        );
+        assert!(output.contains("Pod"), "{output}");
+        assert!(output.contains("size_of :: < A >"), "{output}");
+    }
+
+    /// `bool` has no defined layout for the host, so the struct is not `Pod`.
+    #[test]
+    fn test_bool_makes_structs_plain() {
+        let output = generate_package(
+            "bool",
+            &[("package.wesl", "@export struct A { x: bool }")],
+            &[],
+        );
+        assert!(output.contains("pub x : bool"), "{output}");
+        assert!(!output.contains("Pod"), "{output}");
+    }
+
+    /// Without an entry for the conditional alias, plain structs cannot be
+    /// generated.
+    #[test]
+    #[should_panic(expected = "type alias `math::m16` is declared conditionally")]
+    fn test_conditional_alias_needs_a_type() {
+        let mut options = fixture_options();
+        options.external_types.remove("math::m16");
+        generate_fixture(&options);
+    }
+
+    /// Doc comments are carried over.
+    #[test]
+    fn test_docs_are_generated() {
+        let output = generate_fixture(&fixture_options());
+        assert!(output.contains("#[doc=\"Sitsintherootmodule.\"]"));
+        assert!(output.contains("#[doc=\"Each`vec3f`ispaddedto16bytes.\"]"));
+    }
+
+    /// Doc comments are found above attributes, and stop at other text.
+    #[test]
+    fn test_docs_skip_attributes() {
+        let source = "fn x() {}\n/// First\n///Second\n@align(16)\n@size(32)\nstruct A {}";
+        let start = source.find("struct").expect("struct in source");
+        assert_eq!(doc_comments(source, start), ["First", "Second"]);
+    }
+
+    /// Plain comments are not docs, and a blank line ends the docs.
+    #[test]
+    fn test_docs_stop_at_other_lines() {
+        let source = "/// Detached\n\n// comment\nstruct A {}";
+        let start = source.find("struct").expect("struct in source");
+        assert!(doc_comments(source, start).is_empty());
+    }
+
+    /// Attribute text on the same line is not mistaken for docs.
+    #[test]
+    fn test_docs_with_same_line_attributes() {
+        let source = "/// Docs\n@align(16) struct A {}";
+        let start = source.find("struct").expect("struct in source");
+        assert_eq!(doc_comments(source, start), ["Docs"]);
+    }
+
+    /// The attribute only makes sense on structs.
+    #[test]
+    #[should_panic(expected = "can only be applied to structs, but it is on a function")]
+    fn test_export_rejects_functions() {
+        generate_package("function", &[("package.wesl", "@export fn f() {}")], &[]);
+    }
+
+    /// Members cannot be exported either.
+    #[test]
+    #[should_panic(expected = "can only be applied to structs (found 1 on something else)")]
+    fn test_export_rejects_members() {
+        generate_package(
+            "member",
+            &[("package.wesl", "@export struct A { @export x: u32 }")],
+            &[],
+        );
+    }
+
+    /// Types without a `glam` equivalent are arrays even in `glam` mode.
+    #[test]
+    fn test_glam_mode_falls_back_to_arrays() {
+        let source = "
+            enable f16;
+            @export struct A { h: vec3h, m: mat2x3f, d: mat3x3<f64>, v: vec4f }
+        ";
+        let output = generate_package("fallback", &[("package.wesl", source)], &[]);
+        assert!(output.contains("pub h : [f16 ; 3usize]"), "{output}");
+        assert!(
+            output.contains("pub m : [[f32 ; 4usize] ; 2usize]"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub d : [[f64 ; 4usize] ; 3usize]"),
+            "{output}"
+        );
+        assert!(output.contains("include_wesl :: glam :: Vec4"), "{output}");
+    }
+
+    /// Fields in the same module are named with `self`.
+    #[test]
+    fn test_nearby_types_use_short_paths() {
+        let output = generate_fixture(&fixture_options());
+        assert!(output.contains("pubbounds:self::Bounds"));
+    }
+
+    /// Every option can be given, and `package::` is optional in type names.
+    #[test]
+    fn test_options_all() {
+        let options = parse(quote::quote! {
+            "shaders",
+            vector_types = glam,
+            external_types = {
+                "package::a::B" => crate::B,
+                "c::D" => f32,
+            },
+        });
+        assert_eq!(options.vector_types, VectorTypes::Glam);
+        assert_eq!(options.external_types.len(), 2);
+        assert!(options.external_types.contains_key("a::B"));
+        assert!(options.external_types.contains_key("c::D"));
+    }
+
+    /// Only the path is required.
+    #[test]
+    fn test_options_default() {
+        let options = parse(quote::quote!("shaders"));
+        assert_eq!(options.path, "shaders");
+        assert!(options.external_types.is_empty());
+        assert_eq!(options.vector_types, VectorTypes::Array);
+    }
+
+    /// The vector types can be arrays or `glam`, and nothing else.
+    #[test]
+    fn test_options_vector_types() {
+        let array = parse(quote::quote!("shaders", vector_types = array));
+        assert_eq!(array.vector_types, VectorTypes::Array);
+        assert!(syn::parse2::<Options>(quote::quote!("shaders", vector_types = nalgebra)).is_err());
+    }
+
+    /// Visibility, and the paths of other crates, are not configurable.
+    #[test]
+    fn test_options_removed() {
+        assert!(syn::parse2::<Options>(quote::quote!("shaders", vis = pub(crate))).is_err());
+        assert!(syn::parse2::<Options>(quote::quote!("shaders", glam = ::glam)).is_err());
+        assert!(syn::parse2::<Options>(quote::quote!("shaders", bytemuck = ::bytemuck)).is_err());
+        assert!(syn::parse2::<Options>(quote::quote!("shaders", types = {})).is_err());
+    }
+
+    /// Unknown options are rejected.
+    #[test]
+    fn test_options_unknown() {
+        let result = syn::parse2::<Options>(quote::quote!("shaders", nonsense = 3));
+        assert!(result.is_err());
+    }
+
+    /// The explicit padding is placed where WGSL's alignment rules need it.
+    #[test]
+    fn test_padding_is_generated() {
+        let output = generate_fixture(&fixture_options());
+        assert!(output.contains("pub_padding0:[u8;4usize],#[doc"));
+        assert!(output.contains("pubmax:::include_wesl::glam::Vec3"));
+        assert!(output.contains("pub_padding1:[u8;4usize]"));
+        assert!(output.contains("pubstructRotation"));
+        assert!(output.contains("::include_wesl::glam::Mat3A"));
+    }
+
+    /// Only structs marked `@export` are exported.
+    #[test]
+    fn test_private_structs_are_not_exported() {
+        let output = generate_package(
+            "private",
+            &[(
+                "package.wesl",
+                "struct A { x: u32 }\n@export struct B { x: u32 }",
+            )],
+            &[],
+        );
+        assert!(!output.contains("struct A"), "{output}");
+        assert!(output.contains("struct B"), "{output}");
+    }
+
+    /// Visibility has nothing to do with exporting.
+    #[test]
+    fn test_public_structs_are_not_exported() {
+        let output = generate_package(
+            "public",
+            &[(
+                "package.wesl",
+                "public struct A { x: u32 }\n@export struct B { x: u32 }",
+            )],
+            &[],
+        );
+        assert!(!output.contains("struct A"), "{output}");
+        assert!(output.contains("struct B"), "{output}");
+    }
+
+    /// Replacing an exported struct generates a size check, not a struct.
+    #[test]
+    fn test_replaced_exports_are_only_checked() {
+        let output = generate_package(
+            "replaced",
+            &[("package.wesl", "@export struct A { x: u32, y: u32 }")],
+            &[("A", syn::parse_quote!([u32; 2]))],
+        );
+        assert!(!output.contains("struct A"), "{output}");
+        assert!(output.contains("size_of :: < [u32 ; 2] >"), "{output}");
+    }
+
+    /// A struct that contains a plain struct cannot be `Pod` either.
+    #[test]
+    fn test_structs_containing_plain_structs_are_plain() {
+        let source = "@export struct A { x: bool }\n@export struct B { a: A, y: u32 }";
+        let output = generate_package("nested", &[("package.wesl", source)], &[]);
+        assert!(output.contains("struct B"), "{output}");
+        assert!(!output.contains("Pod"), "{output}");
+    }
+
+    /// Structs are found in other modules that WESL loads because the shader
+    /// uses them.
+    #[test]
+    fn test_structs_in_used_modules_are_found() {
+        let output = generate_fixture(&fixture_options());
+
+        assert!(output.contains("pubmodscene{"));
+        assert!(output.contains("pubmodmodel{"));
+        for name in [
+            "Header",
+            "Aabb",
+            "Bounds",
+            "Brick",
+            "Immediates",
+            "Rotation",
+            "Material",
+        ] {
+            assert!(
+                output.contains(&format!("pubstruct{name}{{")),
+                "{name} missing"
+            );
+        }
+    }
+
+    /// Fields that are not exported, and not replaced, are reported.
+    #[test]
+    #[should_panic(expected = "`scene::model::Handle` is not exported")]
+    fn test_unexported_field_types_are_reported() {
+        let mut options = fixture_options();
+        options.external_types.remove("scene::model::Handle");
+        generate_fixture(&options);
+    }
+
+    /// Modules that the main module does not use are not loaded by WESL, so
+    /// their structs are not exported.
+    #[test]
+    fn test_unimported_modules_are_not_exported() {
+        let output = generate_package(
+            "unimported",
+            &[
+                ("package.wesl", "@export struct A { x: u32 }"),
+                ("other.wesl", "@export struct B { x: u32 }"),
+            ],
+            &[],
+        );
+        assert!(output.contains("struct A"), "{output}");
+        assert!(!output.contains("struct B"), "{output}");
+    }
+
+    /// A struct that has a different layout in different variants is plain,
+    /// and needs the caller to say what the variant-dependent types are.
+    #[test]
+    fn test_variant_dependent_layout_makes_structs_plain() {
+        let source = VARIANT_SOURCE;
+        let output = generate_package(
+            "variants",
+            &[("package.wesl", source)],
+            &[("m16", syn::parse_quote!(f32))],
+        );
+        assert!(output.contains("pub x : f32"), "{output}");
+        assert!(!output.contains("Pod"), "{output}");
+    }
+
+    /// Without a type for the variant-dependent alias, there is nothing to
+    /// generate.
+    #[test]
+    #[should_panic(expected = "add `\"m16\" => <rust type>` to the `external_types` option")]
+    fn test_variant_dependent_layout_needs_a_type() {
+        generate_package("variants_error", &[("package.wesl", VARIANT_SOURCE)], &[]);
+    }
+
+    /// The shaders used by the tests.
+    fn fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../include_wesl/tests/structs")
+    }
+
+    /// The options used with the fixture.
+    fn fixture_options() -> Options {
+        let mut options = parse(quote::quote! {
+            "structs",
+            external_types = {
+                "scene::model::Mask" => ::include_wesl::glam::UVec2,
+                "scene::model::Handle" => [u32; 2],
+                "math::m16" => f32,
+            }
+        });
+        options.vector_types = VectorTypes::Glam;
+        options
+    }
+
+    /// Generates the code for the fixture, with the whitespace removed to make
+    /// matching text easier.
+    fn generate_fixture(options: &Options) -> String {
+        generate(&fixture(), options).0.to_string().replace(' ', "")
+    }
+
+    /// Creates a package in a fresh temporary directory and generates code
+    /// for it with the fixture options (apart from the paths).
+    fn generate_package(name: &str, files: &[(&str, &str)], types: &[(&str, syn::Type)]) -> String {
+        let directory = TempDirectory(std::env::temp_dir().join(format!(
+            "include_wesl_structs_{}_{name}",
+            std::process::id()
+        )));
+        let _ = std::fs::remove_dir_all(&directory.0);
+        std::fs::create_dir_all(&directory.0).expect("directory should be created");
+        for (file, contents) in files {
+            std::fs::write(directory.0.join(file), contents).expect("file should be written");
+        }
+
+        let mut options = parse(quote::quote!("unused"));
+        options.vector_types = VectorTypes::Glam;
+        options.external_types.extend(
+            types
+                .iter()
+                .map(|(path, ty)| (path.to_string(), ty.clone())),
+        );
+        generate(&directory.0, &options).0.to_string()
+    }
+
+    /// Parses macro arguments.
+    fn parse(tokens: proc_macro2::TokenStream) -> Options {
+        syn::parse2(tokens).expect("options should parse")
+    }
+
+    /// A directory that is deleted when it goes out of scope.
+    struct TempDirectory(PathBuf);
+
+    impl Drop for TempDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The source of a package with a struct that has a different layout in
+    /// different variants.
+    const VARIANT_SOURCE: &str = "
+        @if(half) enable f16;
+        @if(half) alias m16 = f16;
+        @if(!half) alias m16 = f32;
+        @export struct A { x: m16, y: u32 }
+    ";
+}
