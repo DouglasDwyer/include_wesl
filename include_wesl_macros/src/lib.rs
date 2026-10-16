@@ -78,20 +78,7 @@ pub fn include_wesl(path: TokenStream) -> TokenStream {
 ///         pub max: [f32; 2],
 ///     }
 ///
-///     impl Default for Aabb {
-///         fn default() -> Self {
-///             bytemuck::Zeroable::zeroed()
-///         }
-///     }
-///
-///     // Compile-time assertions check that the size and field offsets match the
-///     // layout of the WESL struct (abbreviated):
-///     const _: () = {
-///         assert!(size_of::<Aabb>() == 16);
-///         assert!(offset_of!(Aabb, min) == 0);
-///         assert!(offset_of!(Aabb, max) == 8);
-///         // ...
-///     };
+///     // ...
 /// }
 /// ```
 #[cfg(feature = "structs")]
