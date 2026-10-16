@@ -44,6 +44,56 @@ pub fn include_wesl(path: TokenStream) -> TokenStream {
 
 /// Generates Rust definitions for the WESL structs marked `@export`. See the crate
 /// documentation for details.
+///
+/// The `structs` feature flag is required for this macro.
+///
+/// # Example
+///
+/// This is how you might generate bindings for your WESL types in Rust:
+///
+/// ```wgsl
+/// // shader.wesl
+/// @export struct Aabb {
+///     min: vec2f,
+///     max: vec2f
+/// }
+/// ```
+///
+/// ```rust,ignore
+/// // main.rs
+/// mod shader {
+///     include_wesl_structs!("shader.wesl");
+/// }
+/// ```
+///
+/// The macro will expand to include a type definition for each `@export` type:
+///
+/// ```rust,ignore
+/// // main.rs
+/// mod shader {
+///     #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+///     #[repr(C)]
+///     pub struct Aabb {
+///         pub min: [f32; 2],
+///         pub max: [f32; 2],
+///     }
+///
+///     impl Default for Aabb {
+///         fn default() -> Self {
+///             bytemuck::Zeroable::zeroed()
+///         }
+///     }
+///
+///     // Compile-time assertions check that the size and field offsets match the
+///     // layout of the WESL struct (abbreviated):
+///     const _: () = {
+///         assert!(size_of::<Aabb>() == 16);
+///         assert!(offset_of!(Aabb, min) == 0);
+///         assert!(offset_of!(Aabb, max) == 8);
+///         // ...
+///     };
+/// }
+/// ```
 #[cfg(feature = "structs")]
 #[proc_macro]
 pub fn include_wesl_structs(input: TokenStream) -> TokenStream {
