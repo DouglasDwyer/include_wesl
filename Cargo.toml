@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/DouglasDwyer/include_wesl"
 readme = "README.md"
 description = """
-Tiny macro to embed a WESL package with compile-time validation
+Macros to embed a WESL package with compile-time validation
 """
 
 [workspace.dependencies]

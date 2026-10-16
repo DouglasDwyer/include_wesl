@@ -3,7 +3,7 @@
 [![Crates.io](https://img.shields.io/crates/v/include_wesl.svg)](https://crates.io/crates/include_wesl)
 [![Docs.rs](https://docs.rs/include_wesl/badge.svg)](https://docs.rs/include_wesl)
 
-Tiny proc macros to include a [WESL package](https://wesl-lang.dev) in your binary, and verify that it is valid at compile time.
+Proc macros to include a [WESL package](https://wesl-lang.dev) in your binary, and verify that it is valid at compile time.
 
 ## Supported functionality
 
