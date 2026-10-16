@@ -1,6 +1,13 @@
 #![doc = include_str!("../README.md")]
 
 pub use include_wesl_macros::*;
+
+#[cfg(feature = "structs")]
+pub use bytemuck;
+
+#[cfg(feature = "glam")]
+pub use glam;
+
 use std::borrow::*;
 use std::collections::*;
 use wgpu::*;

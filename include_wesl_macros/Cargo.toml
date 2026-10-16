@@ -11,6 +11,15 @@ description.workspace = true
 [lib]
 proc-macro = true
 
+[features]
+# Allow `vector_types = glam` in `include_wesl_structs!`.
+glam = [ "structs" ]
+
+# Enable the `include_wesl_structs!` macro.
+structs = [
+    "syn/clone-impls", "syn/derive", "syn/parsing", "syn/printing", "syn/proc-macro"
+]
+
 [dependencies]
 bincode.workspace = true
 naga = { workspace = true, features = [ "serialize", "wgsl-in" ] }

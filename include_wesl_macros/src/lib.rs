@@ -9,6 +9,10 @@ use std::path::*;
 use wesl::sourcemap::*;
 use wesl::*;
 
+/// Supports generation of Rust struct definitions from WESL.
+#[cfg(feature = "structs")]
+mod structs;
+
 /// Compiles the WESL shaders at a path at build time, and expands to a
 /// `WeslPackage` constant expression.
 #[proc_macro]
@@ -34,6 +38,78 @@ pub fn include_wesl(path: TokenStream) -> TokenStream {
                 &[ #(#serialized_variants),* ]
             )
         }
+    }
+    .into()
+}
+
+/// Generates Rust definitions for the WESL structs marked `@export`. See the crate
+/// documentation for details.
+///
+/// The `structs` feature flag is required for this macro.
+///
+/// # Example
+///
+/// This is how you might generate bindings for your WESL types in Rust:
+///
+/// ```wgsl
+/// // shader.wesl
+/// @export struct Aabb {
+///     min: vec2f,
+///     max: vec2f
+/// }
+/// ```
+///
+/// ```rust,ignore
+/// // main.rs
+/// mod shader {
+///     include_wesl_structs!("shader.wesl");
+/// }
+/// ```
+///
+/// The macro will expand to include a type definition for each `@export` type:
+///
+/// ```rust,ignore
+/// // main.rs
+/// mod shader {
+///     #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+///     #[repr(C)]
+///     pub struct Aabb {
+///         pub min: [f32; 2],
+///         pub max: [f32; 2],
+///     }
+///
+///     impl Default for Aabb {
+///         fn default() -> Self {
+///             bytemuck::Zeroable::zeroed()
+///         }
+///     }
+///
+///     // Compile-time assertions check that the size and field offsets match the
+///     // layout of the WESL struct (abbreviated):
+///     const _: () = {
+///         assert!(size_of::<Aabb>() == 16);
+///         assert!(offset_of!(Aabb, min) == 0);
+///         assert!(offset_of!(Aabb, max) == 8);
+///         // ...
+///     };
+/// }
+/// ```
+#[cfg(feature = "structs")]
+#[proc_macro]
+pub fn include_wesl_structs(input: TokenStream) -> TokenStream {
+    let options = syn::parse_macro_input!(input as structs::Options);
+    let shader_path = resolve_path(&options.path);
+
+    if options.vector_types == structs::VectorTypes::Glam && !cfg!(feature = "glam") {
+        fail("error: `vector_types = glam` requires the `glam` feature of `include_wesl`");
+    }
+
+    let (tokens, files) = structs::generate(&shader_path, &options);
+    let tracked_files = track_files(files);
+
+    quote::quote! {
+        #tracked_files
+        #tokens
     }
     .into()
 }
@@ -66,7 +142,10 @@ fn collect_features(compilation: &CompileResult) -> Vec<String> {
 fn compile_naga(compilation: &CompileResult) -> Module {
     let map = compilation.sourcemap().expect("source map not generated");
 
-    let module = naga::front::wgsl::parse_str(compilation.wgsl()).unwrap_or_else(|e| {
+    // The attributes are replaced by whitespace so that the offsets in the
+    // source map stay accurate.
+    let wgsl = strip_markers(compilation.wgsl());
+    let module = naga::front::wgsl::parse_str(&wgsl).unwrap_or_else(|e| {
         let labels = e
             .labels()
             .filter_map(|(span, msg)| Some((span.to_range()?, msg.to_string())));
@@ -86,6 +165,33 @@ fn compile_naga(compilation: &CompileResult) -> Module {
         });
 
     module
+}
+
+/// Replaces every `@export` attribute in `wgsl` with spaces. The attribute is
+/// only meaningful to `include_wesl_structs!`, and Naga would reject it. The
+/// output has the same length as the input.
+fn strip_markers(wgsl: &str) -> String {
+    let bytes = wgsl.as_bytes();
+    let mut result = wgsl.to_string();
+    let mut search_from = 0;
+
+    while let Some(offset) = wgsl[search_from..].find('@') {
+        let start = search_from + offset;
+        let name_start = start + 1;
+        let name_end = bytes[name_start..]
+            .iter()
+            .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            .map_or(bytes.len(), |end| name_start + end);
+
+        if &wgsl[name_start..name_end] == "export" {
+            // Both ends are ASCII, so these are character boundaries.
+            result.replace_range(start..name_end, &" ".repeat(name_end - start));
+        }
+
+        search_from = name_end;
+    }
+
+    result
 }
 
 /// Compiles the WESL shader package at `path` to WGSL, where the feature flags
@@ -115,11 +221,10 @@ fn compile_unevaluated(path: &Path) -> CompileResult {
     )
 }
 
-/// Compiles the WESL shader package at `path`. If `lower` is true,
-/// WESL-specific syntax is removed so that the output can be parsed as WGSL.
-/// The proc macro will fail with an error if there are any issues.
-fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
-    let compiler = Compiler::new(CompileOptions {
+/// The options that every compilation in this crate uses, apart from the
+/// feature flags.
+fn compile_options(features: wesl::Features) -> CompileOptions {
+    CompileOptions {
         imports: true,
         condcomp: true,
         constants: Constants::default(),
@@ -136,7 +241,14 @@ fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
         strip: false,
         validate: false,
         visibility: true,
-    });
+    }
+}
+
+/// Compiles the WESL shader package at `path`. If `lower` is true,
+/// WESL-specific syntax is removed so that the output can be parsed as WGSL.
+/// The proc macro will fail with an error if there are any issues.
+fn compile_wesl(path: &Path, features: wesl::Features) -> CompileResult {
+    let compiler = Compiler::new(compile_options(features));
 
     match compiler.compile(path) {
         Ok(result) => result,
@@ -166,8 +278,15 @@ fn compile_variants(path: &Path, features: &[String]) -> Vec<Module> {
 /// panics. This ensures that `args` are pretty-printed without indentation,
 /// since normally the panic message from a proc macro gets extra indented.
 fn fail(args: impl std::fmt::Display) -> ! {
-    eprintln!("\n{}\n", args);
-    panic!("shader compilation failed");
+    // Tests check the message, so it needs to be part of the panic.
+    #[cfg(test)]
+    panic!("{args}");
+
+    #[cfg(not(test))]
+    {
+        eprintln!("\n{}\n", args);
+        panic!("shader compilation failed");
+    }
 }
 
 /// Determines the location of the shaders that were requested by the macro
@@ -284,6 +403,19 @@ mod tests {
         assert_eq!(flags["a"], Feature::Enable);
         assert_eq!(flags["b"], Feature::Disable);
         assert_eq!(flags["c"], Feature::Enable);
+    }
+
+    /// The attribute for exporting structs is invisible to Naga.
+    #[test]
+    fn markers_are_replaced_by_whitespace() {
+        let source = "@export struct A { @size(8) x: u32 }\n@exported fn f() {} @export";
+        let stripped = strip_markers(source);
+
+        assert_eq!(stripped.len(), source.len());
+        assert_eq!(
+            stripped,
+            "        struct A { @size(8) x: u32 }\n@exported fn f() {}        "
+        );
     }
 
     /// A mask has to be able to hold one bit for every feature.
