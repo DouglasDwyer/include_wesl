@@ -26,6 +26,8 @@ include_wesl_macros = { path = "include_wesl_macros" }
 # External dependencies
 
 bincode = { version = "2.0.1", default-features = false, features = [ "alloc", "serde" ] }
+bytemuck = { version = "1.25.0", default-features = false, features = [ "derive" ] }
+glam = { version = ">=0.34.1", default-features = false, features = [ "all-types", "bytemuck", "std" ] }
 naga = { version = "30.0.1", default-features = false }
 proc-macro2 = { version = "1", default-features = false }
 quote = { version = "1", default-features = false, features = [ "proc-macro" ] }

@@ -3,15 +3,19 @@
 [![Crates.io](https://img.shields.io/crates/v/include_wesl.svg)](https://crates.io/crates/include_wesl)
 [![Docs.rs](https://docs.rs/include_wesl/badge.svg)](https://docs.rs/include_wesl)
 
-A tiny proc macro to include a [WESL package](https://wesl-lang.dev) in your binary, and verify that it is valid at compile time.
+Tiny proc macros to include a [WESL package](https://wesl-lang.dev) in your binary, and verify that it is valid at compile time.
 
 ## Supported functionality
 
-- [Conditional compilation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md)
-- [Import statements](https://github.com/webgpu-tools/wesl-spec/blob/main/Imports.md)
-- All Naga extensions
+- Embedding all variants of a shader using the `include_wesl!` macro
+  - [Conditional compilation](https://github.com/webgpu-tools/wesl-spec/blob/main/ConditionalTranslation.md)
+  - [Import statements](https://github.com/webgpu-tools/wesl-spec/blob/main/Imports.md)
+  - All Naga extensions
+- Generating Rust-side structs for WESL types using the `include_wesl_structs!` macro
 
 ## Example
+
+### `include_wesl!`
 
 This is how you might create a [`wgpu`](https://github.com/gfx-rs/wgpu) shader module:
 
@@ -56,3 +60,92 @@ device.create_shader_module(&ShaderModuleDescriptor {
     ])
 })
 ```
+
+### `include_wesl_structs!`
+
+> [!NOTE]
+> The `structs` feature flag is required for this functionality.
+
+This is how you might generate bindings for your WESL types in Rust:
+
+```wgsl
+// shader.wesl
+@export struct Aabb {
+    min: vec2f,
+    max: vec2f
+}
+```
+
+```rust,ignore
+// main.rs
+mod shader {
+    include_wesl_structs!("shader.wesl");
+}
+```
+
+The macro will expand to include a type definition for each `@export` type:
+
+```rust,ignore
+// main.rs
+mod shader {
+    #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+    #[repr(C)]
+    pub struct Aabb {
+        pub min: [f32; 2],
+        pub max: [f32; 2],
+    }
+
+    impl Default for Aabb {
+        fn default() -> Self {
+            bytemuck::Zeroable::zeroed()
+        }
+    }
+
+    // Compile-time assertions check that the size and field offsets match the
+    // layout of the WESL struct (abbreviated):
+    const _: () = {
+        assert!(size_of::<Aabb>() == 16);
+        assert!(offset_of!(Aabb, min) == 0);
+        assert!(offset_of!(Aabb, max) == 8);
+        // ...
+    };
+}
+```
+
+The generated bindings will mirror the [package layout](https://github.com/webgpu-tools/wesl-spec/blob/main/Imports.md) of the WESL, with modules and submodules. Any structs that are FFI-compatible will automatically derive `bytemuck::Pod`.
+
+If conditional compilation causes the struct layout to differ between shader variations, a compilation error will be raised:
+
+```wgsl
+@if(SHADER_F16) alias m16 = f16;
+@if(!SHADER_F16) alias m16 = f32;
+
+@export struct Material {
+    frequency: m16
+}
+```
+
+```text
+error in exported struct `Material`: type alias `m16` is declared conditionally,
+so it has no single Rust type; add `"m16" => <rust type>` to the `external_types` option
+```
+
+#### Customizing the bindings
+
+The `include_wesl_structs!` has the following options:
+
+```rust,ignore
+include_wesl_structs!(
+    "shaders",
+    vector_types = glam,
+    external_types = {
+        "math::brick::BrickBool" => ::vxcore::math::brick::Brick<bool>,
+        "math::m16" => f32,
+    }
+);
+```
+
+- `external_types`: Manually-defined Rust types that should replace their WESL counterparts. Field assertions apply to replaced field types too. Type aliases may also be given a type here.
+- `vector_types`: How vectors and matrices are generated. One of the following:
+  - `array`: use standard Rust arrays. For instance, `vec3f` becomes `[f32; 3]`.
+  - `glam`: use [`glam`](https://crates.io/crates/glam) types. For instance, `vec3f` becomes `Vec3`.

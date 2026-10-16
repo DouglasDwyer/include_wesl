@@ -9,8 +9,17 @@ readme.workspace = true
 description.workspace = true
 
 
+[features]
+# Re-export `glam`, so that `include_wesl_structs!` can use `vector_types = glam`.
+glam = [ "structs", "dep:glam", "include_wesl_macros/glam" ]
+
+# Enable the `include_wesl_structs!` macro.
+structs = [ "dep:bytemuck", "include_wesl_macros/structs" ]
+
 [dependencies]
 bincode.workspace = true
+bytemuck = { workspace = true, optional = true }
+glam = { workspace = true, optional = true }
 include_wesl_macros.workspace = true
 naga = { workspace = true, features = [ "deserialize" ] }
 wgpu.workspace = true
