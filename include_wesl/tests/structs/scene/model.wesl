@@ -3,8 +3,7 @@ import package::math::m16;
 /// An axis-aligned box.
 ///
 /// Each `vec3f` is padded to 16 bytes.
-@export
-struct Aabb {
+@export struct Aabb {
     /// The lower corner.
     min: vec3f,
     /// The upper corner.
@@ -12,13 +11,11 @@ struct Aabb {
 }
 
 /// Packed bounds.
-@export
-struct Bounds {
+@export struct Bounds {
     inner: array<u32, 3>
 }
 
-@export
-struct Brick {
+@export struct Brick {
     bounds: Bounds,
     data_offset: u32,
     surface: Mask,
@@ -34,21 +31,18 @@ struct Handle {
     length: u32
 }
 
-@export
-struct Immediates {
+@export struct Immediates {
     view_projection: mat4x4f,
     camera_position: vec3f
 }
 
-@export
-struct Rotation {
+@export struct Rotation {
     basis: mat3x3f,
     scale: f32
 }
 
 /// Not blittable, but still useful on the CPU.
-@export
-struct Material {
+@export struct Material {
     /// The percentage of voxels with decorations.
     frequency: m16,
     ids: vec2u,

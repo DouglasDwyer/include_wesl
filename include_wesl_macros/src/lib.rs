@@ -408,13 +408,13 @@ mod tests {
     /// The attribute for exporting structs is invisible to Naga.
     #[test]
     fn markers_are_replaced_by_whitespace() {
-        let source = "@export\nstruct A { @size(8) x: u32 }\n@exported fn f() {} @export";
+        let source = "@export struct A { @size(8) x: u32 }\n@exported fn f() {} @export";
         let stripped = strip_markers(source);
 
         assert_eq!(stripped.len(), source.len());
         assert_eq!(
             stripped,
-            "       \nstruct A { @size(8) x: u32 }\n@exported fn f() {}        "
+            "        struct A { @size(8) x: u32 }\n@exported fn f() {}        "
         );
     }
 
