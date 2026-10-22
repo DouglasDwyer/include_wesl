@@ -20,11 +20,11 @@ pub fn include_wesl(path: TokenStream) -> TokenStream {
     let requested_path = syn::parse_macro_input!(path as syn::LitStr).value();
     let shader_path = resolve_path(&requested_path);
 
-    let unstripped_compilation = compile_unevaluated(&shader_path);
-    let features = collect_features(&unstripped_compilation);
-    let variants = compile_variants(&shader_path, &features);
+    let discovery = discover_features(&shader_path);
+    let features = &discovery.features;
+    let variants = compile_variants(&shader_path, features);
 
-    let tracked_files = track_files(source_files(&unstripped_compilation));
+    let tracked_files = track_files(discovery.files);
     let serialized_variants = variants
         .iter()
         .map(|module| proc_macro2::Literal::byte_string(&serialize_module(module)));
@@ -101,21 +101,80 @@ pub fn include_wesl_structs(input: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Finds every feature mentioned in an `@if` or `@elif` condition of an
-/// unevaluated compilation. Each name is listed exactly once.
+/// Every feature that a package mentions, and the files that were read to
+/// find them.
+struct Discovery {
+    /// The names of the features. Each one is listed exactly once, in order.
+    features: Vec<String>,
+    /// The files that the package consists of, in order.
+    files: Vec<PathBuf>,
+}
+
+/// Finds every feature that the package at `path` mentions in an `@if` or
+/// `@elif` condition, in any module that any combination of the features
+/// causes to be loaded.
+///
+/// Conditional translation can change which modules are loaded (for instance,
+/// with a conditional `import`), and the modules that are loaded can mention
+/// more features. So this compiles every combination of the features found so
+/// far, and repeats with the features that those compilations turned up, until
+/// there is nothing new.
+fn discover_features(path: &Path) -> Discovery {
+    let mut features = Vec::<String>::new();
+    let mut files = BTreeSet::new();
+
+    loop {
+        assert!(
+            features.len() < u32::BITS as usize,
+            "maximum number of conditional features exceeded"
+        );
+
+        let mut found = features.iter().cloned().collect::<BTreeSet<_>>();
+        for enabled_mask in 0..(1u32 << features.len()) {
+            let compilation = compile_partial(path, variant_flags(enabled_mask, &features));
+            found.extend(collect_features(&compilation));
+            files.extend(source_files(&compilation));
+        }
+
+        if found.len() == features.len() {
+            break;
+        }
+
+        features = found.into_iter().collect();
+    }
+
+    Discovery {
+        features,
+        files: files.into_iter().collect(),
+    }
+}
+
+/// Finds every feature mentioned in an `@if` or `@elif` condition of a
+/// compilation that left some conditional translation in place. Each name is
+/// listed exactly once.
+///
+/// This reads the syntax trees of the individual modules, because the linked
+/// output no longer has the `import` statements (and the conditions on them).
 fn collect_features(compilation: &CompileResult) -> Vec<String> {
     use wesl::pass::*;
     use wesl::syntax::*;
 
-    let mut result = Visit::<Attributes>::visit(compilation.syntax())
-        .flatten()
-        .filter_map(|attribute| match &**attribute {
-            Attribute::If(condition) | Attribute::Elif(condition) => Some(condition),
-            _ => None,
-        })
-        .flat_map(|condition| Visit::<TypeExpression>::visit(&**condition))
-        .map(|flag| flag.ident.name().to_string())
-        .collect::<Vec<_>>();
+    let mut result = Vec::new();
+    for module in compilation.modules() {
+        let conditions = Visit::<Attributes>::visit(&module.syntax)
+            .flatten()
+            .filter_map(|attribute| match &**attribute {
+                Attribute::If(condition) | Attribute::Elif(condition) => Some(condition),
+                _ => None,
+            });
+
+        for condition in conditions {
+            result.extend(
+                Visit::<TypeExpression>::visit(&**condition)
+                    .map(|flag| flag.ident.name().to_string()),
+            );
+        }
+    }
 
     result.sort();
     result.dedup();
@@ -194,16 +253,17 @@ fn compile_variant(path: &Path, flags: HashMap<String, Feature>) -> CompileResul
     )
 }
 
-/// Compiles the WESL shader package at `path`, leaving all conditional
-/// translation in place. The result is not valid WGSL, but it can be searched
-/// for feature flags. The proc macro will fail with an error if there are any
+/// Compiles the WESL shader package at `path`, where the feature flags `flags`
+/// are enabled or disabled and the conditional translation for all other flags
+/// is left in place. The result is not valid WGSL, but it can be searched for
+/// feature flags. The proc macro will fail with an error if there are any
 /// issues.
-fn compile_unevaluated(path: &Path) -> CompileResult {
+fn compile_partial(path: &Path, flags: HashMap<String, Feature>) -> CompileResult {
     compile_wesl(
         path,
         Features {
             default: Feature::Keep,
-            ..Default::default()
+            flags,
         },
     )
 }
@@ -419,15 +479,17 @@ mod tests {
     /// is listed once.
     #[test]
     fn features_are_unique_and_sorted() {
-        let compilation = compile_unevaluated(&fixture());
-        assert_eq!(collect_features(&compilation), ["alpha", "beta", "gamma"]);
+        assert_eq!(
+            discover_features(&fixture()).features,
+            ["alpha", "beta", "gamma"]
+        );
     }
 
     /// Imported files are tracked, along with the main one.
     #[test]
     fn every_file_that_is_used_is_reported() {
-        let compilation = compile_unevaluated(&fixture());
-        let names = source_files(&compilation)
+        let names = discover_features(&fixture())
+            .files
             .iter()
             .map(|path| {
                 path.file_name()

@@ -228,6 +228,9 @@ enum Ty {
     Named(String),
 }
 
+/// A type that has been resolved, or the reason why it has no Rust equivalent.
+type TyResult = std::result::Result<Ty, String>;
+
 impl Ty {
     /// Whether values of this type can be copied byte-for-byte to the GPU.
     /// Nested structs are not considered.
@@ -238,6 +241,19 @@ impl Ty {
             | Self::Matrix(_, _, Prim::Bool) => false,
             Self::Scalar(_) | Self::Vector(..) | Self::Matrix(..) | Self::Named(_) => true,
             Self::Array(element, _) => element.is_blittable(),
+        }
+    }
+
+    /// A WGSL-like description of the type, for error messages.
+    fn describe(&self) -> String {
+        match self {
+            Self::Scalar(prim) => prim.tokens().to_string(),
+            Self::Vector(size, prim) => format!("vec{size}<{}>", prim.tokens()),
+            Self::Matrix(columns, rows, prim) => {
+                format!("mat{columns}x{rows}<{}>", prim.tokens())
+            }
+            Self::Array(element, length) => format!("array<{}, {length}>", element.describe()),
+            Self::Named(key) => key.clone(),
         }
     }
 
@@ -273,8 +289,9 @@ struct ExportedMember {
     name: String,
     /// The doc comments on the field.
     docs: Vec<String>,
-    /// The type of the field, as it appears in the unevaluated syntax tree.
-    ty: TypeExpression,
+    /// The type of the field, as it appears in the syntax tree, or the reason
+    /// why it has no Rust equivalent.
+    ty: TyResult,
 }
 
 /// The layout of one member of a blittable struct.
@@ -314,31 +331,175 @@ struct Context<'a> {
     options: &'a Options,
 }
 
+/// A struct that was exported by one or more variants of the shader.
+struct MergedStruct {
+    /// The definition of the struct, from the first variant that has it.
+    export: ExportedStruct,
+    /// The variant that `export` came from.
+    variant: String,
+    /// The layout of the struct, if it is blittable in every variant that has
+    /// it and the layout is the same in all of them.
+    layout: Option<PodLayout>,
+}
+
 /// Parses the macro arguments and produces the generated code.
 /// Also returns the files that the output depends on.
+///
+/// Every combination of the shader's features is compiled, like `include_wesl!`
+/// does. The structs from the variants are combined by path: a struct that only
+/// some variants have (because of a conditional `import`, say) is still generated,
+/// but variants that give the same path conflicting definitions are an error.
 pub fn generate(shader_path: &Path, options: &Options) -> (proc_macro2::TokenStream, Vec<PathBuf>) {
-    let compilation = compile_unevaluated(shader_path);
-    let files = source_files(&compilation);
-    let context = Context::new(&compilation, options);
-    let exports = context.collect_exports();
+    let discovery = discover_features(shader_path);
+    let features = &discovery.features;
+    let mut merged = BTreeMap::<String, MergedStruct>::new();
 
-    let layouts = if exports.is_empty() {
-        HashMap::new()
-    } else {
-        context.blittable_layouts(shader_path, &exports)
-    };
+    for enabled_mask in 0..(1u32 << features.len()) {
+        let variant = describe_variant(enabled_mask, features);
+        let compilation = compile_variant(shader_path, variant_flags(enabled_mask, features));
+        let module = compile_naga(&compilation);
+        let mut layouter = naga::proc::Layouter::default();
+        if let Err(e) = layouter.update(module.to_ctx()) {
+            fail(format!("error: failed to compute layouts: {e}"));
+        }
+
+        let context = Context::new(&compilation, options);
+        for export in context.collect_exports() {
+            let layout = context.struct_layout(&module, &layouter, &export);
+            merge_struct(&mut merged, export, layout, &variant);
+        }
+    }
+
+    let mut layouts = merged
+        .iter()
+        .filter_map(|(key, entry)| Some((key.clone(), entry.layout.clone()?)))
+        .collect::<HashMap<_, _>>();
+    let exports = merged
+        .into_values()
+        .map(|entry| entry.export)
+        .collect::<Vec<_>>();
+    retain_blittable_nesting(&exports, &mut layouts, options);
 
     let mut root = ModuleNode::default();
     for export in &exports {
-        let layout = layouts.get(&export.mangled);
+        let layout = layouts.get(&export.key);
         let tokens = match options.external_types.get(&export.key) {
             Some(replacement) => render_replacement(export, replacement, layout),
-            None => context.render_struct(export, &exports, layout),
+            None => options.render_struct(export, &exports, layout),
         };
         root.insert(&export.module.components, tokens);
     }
 
-    (root.render(&[]), files)
+    (root.render(&[]), discovery.files)
+}
+
+/// Adds the struct `export` from the variant `variant` to `merged`. Fails if
+/// another variant defined the same struct differently.
+fn merge_struct(
+    merged: &mut BTreeMap<String, MergedStruct>,
+    export: ExportedStruct,
+    layout: Option<PodLayout>,
+    variant: &str,
+) {
+    let Some(existing) = merged.get_mut(&export.key) else {
+        merged.insert(
+            export.key.clone(),
+            MergedStruct {
+                export,
+                variant: variant.to_string(),
+                layout,
+            },
+        );
+        return;
+    };
+
+    let key = &export.key;
+    let first = &existing.export;
+    if first.members.len() != export.members.len()
+        || first
+            .members
+            .iter()
+            .zip(&export.members)
+            .any(|(a, b)| a.name != b.name)
+    {
+        fail_in(
+            key,
+            format!(
+                "the fields differ between the variants {} and {variant}",
+                existing.variant
+            ),
+        );
+    }
+
+    for (a, b) in first.members.iter().zip(&export.members) {
+        if a.ty != b.ty {
+            fail_in(
+                key,
+                format!(
+                    "field `{}` is {} in the variant {} but {} in the variant {variant}; if the type comes from a type alias, give it a Rust type with the `external_types` option",
+                    a.name,
+                    describe_member(&a.ty),
+                    existing.variant,
+                    describe_member(&b.ty)
+                ),
+            );
+        }
+    }
+
+    // A struct is only blittable if its layout is the same everywhere.
+    if existing.layout != layout {
+        existing.layout = None;
+    }
+}
+
+/// Removes the layouts of structs that contain exported structs which are not
+/// blittable. Structs can only be blittable if the exported structs inside of
+/// them are.
+fn retain_blittable_nesting(
+    exports: &[ExportedStruct],
+    layouts: &mut HashMap<String, PodLayout>,
+    options: &Options,
+) {
+    loop {
+        let before = layouts.len();
+        let blittable = layouts.keys().cloned().collect::<HashSet<_>>();
+
+        layouts.retain(|_, layout| {
+            layout.members.iter().all(|member| {
+                member.ty.named().into_iter().all(|key| {
+                    blittable.contains(key)
+                        || options.external_types.contains_key(key)
+                        || !exports.iter().any(|export| export.key == key)
+                })
+            })
+        });
+
+        if layouts.len() == before {
+            break;
+        }
+    }
+}
+
+/// Describes a shader variant, for error messages.
+fn describe_variant(mask: u32, features: &[String]) -> String {
+    if features.is_empty() {
+        return "(the only variant)".to_string();
+    }
+
+    let flags = features
+        .iter()
+        .enumerate()
+        .map(|(i, feature)| format!("{feature}={}", mask & (1 << i) != 0))
+        .collect::<Vec<_>>();
+    format!("`{}`", flags.join(", "))
+}
+
+/// Describes the type of a struct member, for error messages.
+fn describe_member(ty: &TyResult) -> String {
+    match ty {
+        Ok(ty) => format!("`{}`", ty.describe()),
+        Err(reason) => format!("unsupported ({reason})"),
+    }
 }
 
 /// Writes the checks for an exported struct that the caller replaced with a
@@ -585,7 +746,7 @@ impl<'a> Context<'a> {
             members.push(ExportedMember {
                 name: member.ident.name().to_string(),
                 docs: doc_comments(source, member.span().range().start),
-                ty: member.ty.clone(),
+                ty: self.tree_type(&member.ty),
             });
         }
 
@@ -606,84 +767,73 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Determines what Rust type a WESL type expression, which is a field of
-    /// the exported struct `owner`, refers to.
-    fn tree_type(&self, owner: &str, expression: &TypeExpression) -> Ty {
+    /// Determines what Rust type a WESL type expression refers to. Returns the
+    /// reason if the type has no Rust equivalent.
+    fn tree_type(&self, expression: &TypeExpression) -> TyResult {
         let name = expression.ident.name().to_string();
         let name = name.as_str();
 
         if let Some(key) = self.item_key(name) {
             if self.options.external_types.contains_key(&key) {
-                return Ty::Named(key);
+                return Ok(Ty::Named(key));
             }
 
-            if let Some(aliases) = self.aliases.get(name) {
-                return match aliases.as_slice() {
-                    [alias] if !alias.attributes.iter().any(is_conditional) => {
-                        self.tree_type(owner, &alias.ty)
-                    }
-                    _ => fail_in(
-                        owner,
-                        format!(
-                            "type alias `{key}` is declared conditionally, so it has no single Rust type; add `\"{key}\" => <rust type>` to the `external_types` option"
-                        ),
-                    ),
-                };
+            if let Some([alias]) = self.aliases.get(name).map(Vec::as_slice) {
+                return self.tree_type(&alias.ty);
             }
 
-            return Ty::Named(key);
+            return Ok(Ty::Named(key));
         }
 
         let args = expression.template_args.as_deref().unwrap_or(&[]);
         let arg_type = |index: usize| match args.get(index).map(|arg| &*arg.expression) {
-            Some(wesl::syntax::Expression::TypeOrIdentifier(inner)) => self.tree_type(owner, inner),
-            _ => fail_in(owner, format!("`{name}` expects a type argument")),
+            Some(wesl::syntax::Expression::TypeOrIdentifier(inner)) => self.tree_type(inner),
+            _ => Err(format!("`{name}` expects a type argument")),
         };
-        let scalar_arg = || match arg_type(0) {
-            Ty::Scalar(prim) => prim,
-            _ => fail_in(owner, format!("`{name}` must have a scalar element type")),
+        let scalar_arg = || match arg_type(0)? {
+            Ty::Scalar(prim) => Ok(prim),
+            _ => Err(format!("`{name}` must have a scalar element type")),
         };
 
         if let Some(prim) = Prim::from_name(name) {
-            return Ty::Scalar(prim);
+            return Ok(Ty::Scalar(prim));
         }
 
         if let Some((size, prim)) = parse_vector_alias(name) {
-            return Ty::Vector(size, prim);
+            return Ok(Ty::Vector(size, prim));
         }
 
         if let Some((columns, rows, prim)) = parse_matrix_alias(name) {
-            return Ty::Matrix(columns, rows, prim);
+            return Ok(Ty::Matrix(columns, rows, prim));
         }
 
         if let Some(size) = name.strip_prefix("vec").and_then(|n| n.parse::<u8>().ok()) {
-            return Ty::Vector(size, scalar_arg());
+            return Ok(Ty::Vector(size, scalar_arg()?));
         }
 
         if let Some((columns, rows)) = name.strip_prefix("mat").and_then(|dimensions| {
             let (columns, rows) = dimensions.split_once('x')?;
             Some((columns.parse::<u8>().ok()?, rows.parse::<u8>().ok()?))
         }) {
-            return Ty::Matrix(columns, rows, scalar_arg());
+            return Ok(Ty::Matrix(columns, rows, scalar_arg()?));
         }
 
         if name == "array" {
-            let element = arg_type(0);
+            let element = arg_type(0)?;
             let length = match args.get(1).map(|arg| &*arg.expression) {
                 Some(wesl::syntax::Expression::Literal(LiteralExpression::AbstractInt(n))) => {
                     *n as u32
                 }
                 Some(wesl::syntax::Expression::Literal(LiteralExpression::U32(n))) => *n,
                 Some(wesl::syntax::Expression::Literal(LiteralExpression::I32(n))) => *n as u32,
-                _ => fail_in(
-                    owner,
-                    "array lengths in structs that are not blittable must be integer literals (runtime-sized arrays cannot be exported)",
-                ),
+                _ => {
+                    return Err("array lengths in structs that are not blittable must be integer literals (runtime-sized arrays cannot be exported)".to_string());
+                }
             };
-            return Ty::Array(Box::new(element), length);
+            return Ok(Ty::Array(Box::new(element), length));
         }
 
-        fail_in(owner, format!("the type `{name}` has no Rust equivalent"))
+        Err(format!("the type `{name}` has no Rust equivalent"))
     }
 
     /// Determines the Rust type that Naga's `ty` corresponds to. Returns `None`
@@ -717,80 +867,6 @@ impl<'a> Context<'a> {
             }
             _ => None,
         }
-    }
-
-    /// Finds the exported structs that can be copied byte-for-byte to the GPU,
-    /// and gets their layouts. A struct qualifies if
-    ///
-    /// - all of its fields are blittable (so no `bool`, for instance),
-    /// - it has the same layout in every combination of shader features, and
-    /// - all of the exported structs it contains qualify.
-    ///
-    /// The result is keyed by the name of the struct in the compiled shader.
-    fn blittable_layouts(
-        &self,
-        shader_path: &Path,
-        exports: &[ExportedStruct],
-    ) -> HashMap<String, PodLayout> {
-        let features = collect_features(self.compilation);
-        let mut result: HashMap<String, PodLayout> = HashMap::new();
-        let mut disqualified = HashSet::new();
-
-        for mask in 0..(1u32 << features.len()) {
-            let module = compile_naga(&compile_variant(
-                shader_path,
-                variant_flags(mask, &features),
-            ));
-            let mut layouter = naga::proc::Layouter::default();
-            if let Err(e) = layouter.update(module.to_ctx()) {
-                fail(format!("error: failed to compute layouts: {e}"));
-            }
-
-            for export in exports {
-                match self.struct_layout(&module, &layouter, export) {
-                    Some(layout) => match result.get(&export.mangled) {
-                        None => {
-                            result.insert(export.mangled.clone(), layout);
-                        }
-                        Some(first) if *first != layout => {
-                            disqualified.insert(export.mangled.clone());
-                        }
-                        Some(_) => {}
-                    },
-                    None => {
-                        disqualified.insert(export.mangled.clone());
-                    }
-                }
-            }
-        }
-
-        result.retain(|name, _| !disqualified.contains(name));
-
-        // Structs can only be blittable if the exported structs inside of them are.
-        loop {
-            let blittable = exports
-                .iter()
-                .filter(|export| result.contains_key(&export.mangled))
-                .map(|export| export.key.as_str())
-                .collect::<HashSet<_>>();
-            let before = result.len();
-
-            result.retain(|_, layout| {
-                layout.members.iter().all(|member| {
-                    member.ty.named().into_iter().all(|key| {
-                        blittable.contains(key)
-                            || self.options.external_types.contains_key(key)
-                            || !exports.iter().any(|export| export.key == key)
-                    })
-                })
-            });
-
-            if result.len() == before {
-                break;
-            }
-        }
-
-        result
     }
 
     /// Reads the layout of an exported struct out of a compiled shader.
@@ -835,7 +911,9 @@ impl<'a> Context<'a> {
             members: result,
         })
     }
+}
 
+impl Options {
     /// Converts a field type of the exported struct `export` into Rust code.
     /// `pod` is whether the struct is blittable.
     fn render_type(
@@ -846,10 +924,10 @@ impl<'a> Context<'a> {
         pod: bool,
     ) -> proc_macro2::TokenStream {
         let glam_name = match ty {
-            Ty::Vector(size, prim) if self.options.vector_types == VectorTypes::Glam => prim
+            Ty::Vector(size, prim) if self.vector_types == VectorTypes::Glam => prim
                 .glam_vector_prefix()
                 .map(|prefix| format!("{prefix}Vec{size}")),
-            Ty::Matrix(columns, rows, prim) if self.options.vector_types == VectorTypes::Glam => {
+            Ty::Matrix(columns, rows, prim) if self.vector_types == VectorTypes::Glam => {
                 glam_matrix(*columns, *rows, *prim, pod)
             }
             _ => None,
@@ -881,7 +959,7 @@ impl<'a> Context<'a> {
                 quote::quote!([#element; #length])
             }
             Ty::Named(key) => {
-                if let Some(replacement) = self.options.external_types.get(key) {
+                if let Some(replacement) = self.external_types.get(key) {
                     return quote::quote!(#replacement);
                 }
 
@@ -998,8 +1076,11 @@ impl<'a> Context<'a> {
         } else {
             let mut fields = Vec::new();
             for member in &export.members {
-                let ty = self.tree_type(&export.key, &member.ty);
-                let ty = self.render_type(export, &ty, exports, false);
+                let ty = match &member.ty {
+                    Ok(ty) => ty,
+                    Err(reason) => fail_in(&export.key, reason),
+                };
+                let ty = self.render_type(export, ty, exports, false);
                 let field = rust_ident(&member.name);
                 let docs = member.docs.iter().map(|line| quote::quote!(#[doc = #line]));
                 fields.push(quote::quote! {
@@ -1200,7 +1281,9 @@ mod tests {
     /// Without an entry for the conditional alias, plain structs cannot be
     /// generated.
     #[test]
-    #[should_panic(expected = "type alias `math::m16` is declared conditionally")]
+    #[should_panic(
+        expected = "field `frequency` is `f32` in the variant `half=false` but `f16` in the variant `half=true`"
+    )]
     fn test_conditional_alias_needs_a_type() {
         let mut options = fixture_options();
         options.external_types.remove("math::m16");
@@ -1310,14 +1393,6 @@ mod tests {
         assert_eq!(options.vector_types, VectorTypes::Array);
     }
 
-    /// The vector types can be arrays or `glam`, and nothing else.
-    #[test]
-    fn test_options_vector_types() {
-        let array = parse(quote::quote!("shaders", vector_types = array));
-        assert_eq!(array.vector_types, VectorTypes::Array);
-        assert!(syn::parse2::<Options>(quote::quote!("shaders", vector_types = nalgebra)).is_err());
-    }
-
     /// Visibility, and the paths of other crates, are not configurable.
     #[test]
     fn test_options_removed() {
@@ -1332,6 +1407,14 @@ mod tests {
     fn test_options_unknown() {
         let result = syn::parse2::<Options>(quote::quote!("shaders", nonsense = 3));
         assert!(result.is_err());
+    }
+
+    /// The vector types can be arrays or `glam`, and nothing else.
+    #[test]
+    fn test_options_vector_types() {
+        let array = parse(quote::quote!("shaders", vector_types = array));
+        assert_eq!(array.vector_types, VectorTypes::Array);
+        assert!(syn::parse2::<Options>(quote::quote!("shaders", vector_types = nalgebra)).is_err());
     }
 
     /// The explicit padding is placed where WGSL's alignment rules need it.
@@ -1462,7 +1545,9 @@ mod tests {
     /// Without a type for the variant-dependent alias, there is nothing to
     /// generate.
     #[test]
-    #[should_panic(expected = "add `\"m16\" => <rust type>` to the `external_types` option")]
+    #[should_panic(
+        expected = "field `x` is `f32` in the variant `half=false` but `f16` in the variant `half=true`"
+    )]
     fn test_variant_dependent_layout_needs_a_type() {
         generate_package("variants_error", &[("package.wesl", VARIANT_SOURCE)], &[]);
     }

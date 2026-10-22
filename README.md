@@ -113,9 +113,12 @@ If conditional compilation causes the struct layout to differ between shader var
 ```
 
 ```text
-error in exported struct `Material`: type alias `m16` is declared conditionally,
-so it has no single Rust type; add `"m16" => <rust type>` to the `external_types` option
+error in exported struct `Material`: field `frequency` is `f32` in the variant `SHADER_F16=false`
+but `f16` in the variant `SHADER_F16=true`; if the type comes from a type alias, give it a Rust
+type with the `external_types` option
 ```
+
+Every combination of the shader's features is compiled, and the structs are combined by their path. A struct that only exists in some variants (for example, because it is in a module that a conditional `import` selects) is still generated. Only variants that give the same path a conflicting definition cause an error.
 
 #### Customizing the bindings
 
