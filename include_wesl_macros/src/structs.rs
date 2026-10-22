@@ -1290,6 +1290,34 @@ mod tests {
         generate_fixture(&options);
     }
 
+    /// Conditional imports can select different modules, and each module can
+    /// mention features that the other does not.
+    #[test]
+    fn test_conditional_imports_find_structs_in_every_variant() {
+        let output = generate_package(
+            "conditional_imports",
+            &[
+                (
+                    "package.wesl",
+                    "@if(RAY) import self::hwrt::cast_ray;\n@else import self::swrt::cast_ray;\n@compute @workgroup_size(1) fn main() { var x = cast_ray(); }",
+                ),
+                (
+                    "hwrt.wesl",
+                    "@export struct HwRay { x: u32 }\nfn cast_ray() -> u32 { @if(INNER) return 1u; @else return 2u; }",
+                ),
+                (
+                    "swrt.wesl",
+                    "@export struct SwRay { y: f32 }\nfn cast_ray() -> u32 { return 3u; }",
+                ),
+            ],
+            &[],
+        );
+        assert!(output.contains("pub mod hwrt"), "{output}");
+        assert!(output.contains("pub struct HwRay"), "{output}");
+        assert!(output.contains("pub mod swrt"), "{output}");
+        assert!(output.contains("pub struct SwRay"), "{output}");
+    }
+
     /// Doc comments are carried over.
     #[test]
     fn test_docs_are_generated() {

@@ -440,6 +440,11 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../include_wesl/tests/shaders")
     }
 
+    /// Shaders where conditions decide which modules are imported.
+    fn imports_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../include_wesl/tests/imports")
+    }
+
     /// Bit `i` of the mask enables the feature at index `i`.
     #[test]
     fn variant_flags_enable_features_by_bit() {
@@ -483,6 +488,33 @@ mod tests {
             discover_features(&fixture()).features,
             ["alpha", "beta", "gamma"]
         );
+    }
+
+    /// A feature that is only on an `import`, and one that is only in a module
+    /// that some combinations of the features do not load, are both found.
+    #[test]
+    fn features_on_imports_and_in_conditionally_loaded_modules_are_found() {
+        assert_eq!(
+            discover_features(&imports_fixture()).features,
+            ["INNER", "RAY"]
+        );
+    }
+
+    /// Every file that some combination of the features loads is tracked.
+    #[test]
+    fn every_file_of_every_combination_is_reported() {
+        let names = discover_features(&imports_fixture())
+            .files
+            .iter()
+            .map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("path has a name")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, ["hwrt.wesl", "package.wesl", "swrt.wesl"]);
     }
 
     /// Imported files are tracked, along with the main one.
