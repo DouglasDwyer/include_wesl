@@ -723,8 +723,13 @@ impl<'a> Context<'a> {
     /// and gets their layouts. A struct qualifies if
     ///
     /// - all of its fields are blittable (so no `bool`, for instance),
-    /// - it has the same layout in every combination of shader features, and
+    /// - it has the same layout in every combination of shader features where
+    ///   it is defined, and
     /// - all of the exported structs it contains qualify.
+    ///
+    /// A struct does not have to be defined in every variant of the shader (for
+    /// instance, its module might only be imported when a feature is enabled).
+    /// It must be defined in at least one, though.
     ///
     /// The result is keyed by the name of the struct in the compiled shader.
     fn blittable_layouts(
@@ -735,6 +740,7 @@ impl<'a> Context<'a> {
         let features = collect_features(self.compilation);
         let mut result: HashMap<String, PodLayout> = HashMap::new();
         let mut disqualified = HashSet::new();
+        let mut defined = HashSet::new();
 
         for mask in 0..(1u32 << features.len()) {
             let module = compile_naga(&compile_variant(
@@ -747,7 +753,12 @@ impl<'a> Context<'a> {
             }
 
             for export in exports {
-                match self.struct_layout(&module, &layouter, export) {
+                let Some(handle) = find_struct(&module, &export.mangled) else {
+                    continue;
+                };
+                defined.insert(export.mangled.as_str());
+
+                match self.struct_layout(&module, &layouter, handle) {
                     Some(layout) => match result.get(&export.mangled) {
                         None => {
                             result.insert(export.mangled.clone(), layout);
@@ -762,6 +773,16 @@ impl<'a> Context<'a> {
                     }
                 }
             }
+        }
+
+        if let Some(export) = exports
+            .iter()
+            .find(|export| !defined.contains(export.mangled.as_str()))
+        {
+            fail_in(
+                &export.key,
+                "the struct was not found in any variant of the compiled shader",
+            );
         }
 
         result.retain(|name, _| !disqualified.contains(name));
@@ -794,25 +815,16 @@ impl<'a> Context<'a> {
     }
 
     /// Reads the layout of an exported struct out of a compiled shader.
+    /// `handle` is the struct's type, from [`find_struct`].
     /// Returns `None` if the struct cannot be copied byte-for-byte.
     fn struct_layout(
         &self,
         module: &Module,
         layouter: &naga::proc::Layouter,
-        export: &ExportedStruct,
+        handle: Handle<Type>,
     ) -> Option<PodLayout> {
-        let Some((handle, _)) = module.types.iter().find(|(_, ty)| {
-            ty.name.as_deref() == Some(export.mangled.as_str())
-                && matches!(ty.inner, TypeInner::Struct { .. })
-        }) else {
-            fail_in(
-                &export.key,
-                "the struct was not found in the compiled shader",
-            );
-        };
-
         let TypeInner::Struct { members, span } = &module.types[handle].inner else {
-            unreachable!("filtered above");
+            unreachable!("filtered by find_struct");
         };
 
         let mut result = Vec::new();
@@ -1018,6 +1030,18 @@ impl<'a> Context<'a> {
             }
         }
     }
+}
+
+/// Finds the struct called `mangled` in a compiled shader. Returns `None` if
+/// this variant of the shader does not define it.
+fn find_struct(module: &Module, mangled: &str) -> Option<Handle<Type>> {
+    module
+        .types
+        .iter()
+        .find(|(_, ty)| {
+            ty.name.as_deref() == Some(mangled) && matches!(ty.inner, TypeInner::Struct { .. })
+        })
+        .map(|(handle, _)| handle)
 }
 
 /// Stops compilation with an error about the exported struct `owner`.
@@ -1467,6 +1491,45 @@ mod tests {
         generate_package("variants_error", &[("package.wesl", VARIANT_SOURCE)], &[]);
     }
 
+    /// A struct in a module that is only imported in some variants is still
+    /// blittable, as long as its layout agrees wherever it exists.
+    #[test]
+    fn test_structs_missing_from_some_variants_are_blittable() {
+        let output = generate_package(
+            "conditional_module",
+            &[
+                ("package.wesl", CONDITIONAL_MODULE_SOURCE),
+                ("sw.wesl", "@export struct B { x: u32, y: f32 }"),
+            ],
+            &[],
+        );
+        assert!(output.contains("struct B"), "{output}");
+        assert!(output.contains("Pod"), "{output}");
+    }
+
+    /// If a struct is missing from some variants but its layout differs in the
+    /// ones that have it, then it is plain.
+    #[test]
+    fn test_conditional_module_with_variant_dependent_layout_is_plain() {
+        let output = generate_package(
+            "conditional_module_layout",
+            &[
+                ("package.wesl", CONDITIONAL_MODULE_SOURCE),
+                (
+                    "sw.wesl",
+                    "@if(half) enable f16;
+                     @if(half) alias m16 = f16;
+                     @if(!half) alias m16 = f32;
+                     @export struct B { x: m16 }",
+                ),
+            ],
+            &[("sw::m16", syn::parse_quote!(f32))],
+        );
+        let (_, module) = output.split_once("pub mod sw").expect("module generated");
+        assert!(module.contains("struct B"), "{output}");
+        assert!(!module.contains("Pod"), "{output}");
+    }
+
     /// The shaders used by the tests.
     fn fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../include_wesl/tests/structs")
@@ -1528,6 +1591,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+
+    /// The source of a package that only imports the module `sw` when the
+    /// `sw` feature is enabled.
+    const CONDITIONAL_MODULE_SOURCE: &str = "
+        @if(sw) import package::sw;
+        @if(sw) fn use_sw(b: sw::B) -> u32 { return 0u; }
+        @export struct A { x: u32 }
+    ";
 
     /// The source of a package with a struct that has a different layout in
     /// different variants.
