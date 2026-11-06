@@ -67,3 +67,31 @@ fn plain_structs_use_arrays() {
     };
     assert_eq!(material.ids, [1, 2]);
 }
+
+/// Atomics and runtime-sized arrays are plain integers and slices here too.
+#[test]
+fn atomics_and_slices_use_arrays() {
+    use scene::model::{Counters, Particles};
+
+    let counters = Counters {
+        head: 1,
+        tail: 2,
+        slots: [3, 4],
+    };
+    assert_eq!(size_of::<Counters>(), 16);
+    assert_eq!(counters.slots, [3, 4]);
+
+    #[repr(C, align(16))]
+    struct Buffer([u32; 12]);
+
+    let buffer = Buffer([0; 12]);
+    // SAFETY: Only the address and length of the result are inspected.
+    let particles =
+        unsafe { &*(core::ptr::slice_from_raw_parts(buffer.0.as_ptr(), 3) as *const Particles) };
+    let ids: &[[u32; 2]] = &particles.ids;
+    assert_eq!(ids.len(), 3);
+    assert_eq!(
+        ids.as_ptr() as usize - (particles as *const Particles).cast::<u8>() as usize,
+        24
+    );
+}

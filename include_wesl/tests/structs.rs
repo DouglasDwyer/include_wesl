@@ -119,3 +119,82 @@ fn plain_structs_allow_unshareable_types() {
     assert!(material.transparent);
     assert_eq!(material.frequency, 0.5);
 }
+
+/// Atomics are plain integers in Rust, and keep their place in the layout.
+#[test]
+fn atomics_become_integers() {
+    use scene::model::Counters;
+
+    assert_eq!(size_of::<Counters>(), 16);
+    assert_eq!(offset_of!(Counters, tail), 4);
+    assert_eq!(offset_of!(Counters, slots), 8);
+
+    let counters = Counters {
+        head: 1,
+        tail: -2,
+        slots: [3, 4],
+    };
+    assert_eq!(
+        bytes_of(&counters),
+        [1, 0, 0, 0, 254, 255, 255, 255, 3, 0, 0, 0, 4, 0, 0, 0]
+    );
+}
+
+/// Views `words` as a dynamically-sized struct whose slice has `count` elements.
+macro_rules! unsized_ref {
+    ($ty:ty, $words:expr, $count:expr) => {
+        // SAFETY: Only the addresses and lengths in the result are inspected,
+        // and the words are valid for every field.
+        unsafe { &*(core::ptr::slice_from_raw_parts($words.as_ptr(), $count) as *const $ty) }
+    };
+}
+
+/// The distance in bytes from the start of `value` to the start of `slice`.
+fn distance<T: ?Sized, E>(value: &T, slice: &[E]) -> usize {
+    slice.as_ptr() as usize - (value as *const T).cast::<u8>() as usize
+}
+
+/// A runtime-sized array is a slice at the end of the struct, at the offset
+/// that WGSL uses.
+#[test]
+fn runtime_arrays_are_slices() {
+    use scene::model::Particles;
+
+    // `count` ends at byte 20, but `vec2u` is 8-byte aligned, so the array
+    // starts at byte 24. The struct is 16-byte aligned because of `origin`.
+    #[repr(C, align(16))]
+    struct Buffer([u32; 12]);
+
+    assert_eq!(offset_of!(Particles, count), 16);
+
+    let buffer = Buffer([0; 12]);
+    let particles = unsized_ref!(Particles, buffer.0, 3);
+    assert_eq!(particles.ids.len(), 3);
+    assert_eq!(distance(particles, &particles.ids), 24);
+    assert_eq!(size_of_val(particles), 48);
+    assert_eq!(align_of_val(particles), 16);
+}
+
+/// Replaced element types and aliases of unsized arrays are followed.
+#[test]
+fn runtime_arrays_use_replaced_types() {
+    use scene::model::Queue;
+
+    let words = [0u32; 5];
+    let queue = unsized_ref!(Queue, words, 2);
+    let handles: &[[u32; 2]] = &queue.handles;
+    assert_eq!(handles.len(), 2);
+    assert_eq!(distance(queue, handles), 4);
+    assert_eq!(size_of_val(queue), 20);
+}
+
+/// Structs that are not blittable can still end in a slice.
+#[test]
+fn plain_structs_can_end_in_slices() {
+    use scene::model::Labels;
+
+    fn takes_labels(labels: &Labels) -> usize {
+        labels.ids.len()
+    }
+    let _ = takes_labels;
+}

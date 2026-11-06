@@ -1636,6 +1636,130 @@ mod tests {
         assert!(!module.contains("Pod"), "{output}");
     }
 
+    /// Atomics are generated as the integers they wrap.
+    #[test]
+    fn test_atomics_are_integers() {
+        let output = generate_package(
+            "atomics",
+            &[(
+                "package.wesl",
+                "@export struct A { x: atomic<u32>, y: atomic<i32>, z: array<atomic<u32>, 2> }",
+            )],
+            &[],
+        );
+        assert!(output.contains("pub x : u32"), "{output}");
+        assert!(output.contains("pub y : i32"), "{output}");
+        assert!(output.contains("pub z : [u32 ; 2usize]"), "{output}");
+        assert!(output.contains("Pod"), "{output}");
+        assert!(!output.contains("atomic"), "{output}");
+    }
+
+    /// Atomics hold integers in a struct that is not blittable too.
+    #[test]
+    fn test_atomics_in_plain_structs() {
+        let output = generate_package(
+            "atomics_plain",
+            &[(
+                "package.wesl",
+                "@export struct A { x: atomic<u32>, y: bool }",
+            )],
+            &[],
+        );
+        assert!(output.contains("pub x : u32"), "{output}");
+        assert!(!output.contains("Pod"), "{output}");
+    }
+
+    /// Blittable structs with runtime-sized arrays are slices with checked
+    /// offsets, but cannot be copied.
+    #[test]
+    fn test_runtime_arrays_are_slices() {
+        let output = generate_package(
+            "runtime",
+            &[(
+                "package.wesl",
+                "@export struct A { n: u32, items: array<u32> }",
+            )],
+            &[],
+        );
+        assert!(output.contains("pub items : [u32]"), "{output}");
+        assert!(output.contains("align_of"), "{output}");
+        assert!(!output.contains("Copy"), "{output}");
+        assert!(!output.contains("Zeroable"), "{output}");
+        assert!(!output.contains("size_of :: < A >"), "{output}");
+    }
+
+    /// Structs that are not blittable can end in slices, but they have no
+    /// layout to check.
+    #[test]
+    fn test_plain_runtime_arrays_are_slices() {
+        let output = generate_package(
+            "runtime_plain",
+            &[(
+                "package.wesl",
+                "alias List = array<u32>;\n@export struct A { b: bool, items: List }",
+            )],
+            &[],
+        );
+        assert!(output.contains("pub items : [u32]"), "{output}");
+        assert!(!output.contains("align_of"), "{output}");
+        assert!(!output.contains("Copy"), "{output}");
+        assert!(output.contains("Debug"), "{output}");
+    }
+
+    /// Replacing a struct with a runtime-sized array only skips the size check.
+    #[test]
+    fn test_replaced_runtime_array_structs_are_not_checked() {
+        let output = generate_package(
+            "runtime_replaced",
+            &[(
+                "package.wesl",
+                "@export struct A { n: u32, items: array<u32> }",
+            )],
+            &[("A", syn::parse_quote!(crate::Custom))],
+        );
+        assert!(!output.contains("struct A"), "{output}");
+        assert!(!output.contains("size_of"), "{output}");
+    }
+
+    /// Runtime-sized arrays are only allowed at the end of a struct.
+    #[test]
+    #[should_panic]
+    fn test_runtime_arrays_must_be_last() {
+        generate_package(
+            "runtime_middle",
+            &[(
+                "package.wesl",
+                "@export struct A { items: array<u32>, n: u32 }",
+            )],
+            &[],
+        );
+    }
+
+    /// Structs with runtime-sized arrays cannot be fields of other structs.
+    #[test]
+    #[should_panic]
+    fn test_runtime_array_structs_cannot_be_fields() {
+        generate_package(
+            "runtime_nested",
+            &[(
+                "package.wesl",
+                "@export struct A { items: array<u32> }\n@export struct B { a: A }",
+            )],
+            &[],
+        );
+    }
+
+    /// Atomics cannot hold booleans.
+    #[test]
+    #[should_panic]
+    fn test_atomics_cannot_be_booleans() {
+        generate_package(
+            "atomic_float",
+            &[("package.wesl", "@export struct A { x: atomic<bool> }")],
+            &[],
+        );
+    }
+
     /// The shaders used by the tests.
     fn fixture() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../include_wesl/tests/structs")

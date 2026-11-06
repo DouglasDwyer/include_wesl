@@ -51,6 +51,37 @@ struct Handle {
     bounds: Bounds
 }
 
+/// Counters that the GPU updates atomically. They are plain integers in Rust.
+@export struct Counters {
+    head: atomic<u32>,
+    tail: atomic<i32>,
+    slots: array<atomic<u32>, 2>
+}
+
+/// A header followed by a runtime-sized list.
+///
+/// The list is padded after `count`, because `vec2u` is 8-byte aligned.
+@export struct Particles {
+    origin: vec4f,
+    count: u32,
+    /// One entry per particle.
+    ids: array<vec2u>
+}
+
+alias Handles = array<Handle>;
+
+/// A runtime-sized list of elements that the caller replaced.
+@export struct Queue {
+    head: atomic<u32>,
+    handles: Handles
+}
+
+/// Not blittable, so it has no helpers for viewing bytes.
+@export struct Labels {
+    enabled: bool,
+    ids: array<u32>
+}
+
 /// Gives the main module something to use, so that this module is loaded.
 fn touch() {
 }
