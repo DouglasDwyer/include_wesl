@@ -20,6 +20,12 @@
 //   the shader disagree about them (for instance, if a field is a `f16` in one
 //   variant and `f32` in another). These structs make no promise about their
 //   memory layout.
+//
+// `atomic<T>` fields become plain `T` fields, since atomics have the layout of
+// their underlying integer. A struct that ends in a runtime-sized array
+// (`array<T>`) becomes a dynamically-sized Rust struct whose last field is a
+// slice (`[T]`). Such structs cannot be `Copy` or `Pod`, but a blittable one
+// still has its field offsets and sizes checked against the shader.
 
 use super::*;
 use syn::parse::*;
@@ -223,6 +229,9 @@ enum Ty {
     Matrix(u8, u8, Prim),
     /// An array of known length.
     Array(Box<Ty>, u32),
+    /// An array whose length is only known at runtime. These can only be the
+    /// last member of a struct.
+    RuntimeArray(Box<Ty>),
     /// A struct or alias, named by its path from the package root
     /// (`module::submodule::Name`).
     Named(String),
@@ -237,7 +246,7 @@ impl Ty {
             | Self::Vector(_, Prim::Bool)
             | Self::Matrix(_, _, Prim::Bool) => false,
             Self::Scalar(_) | Self::Vector(..) | Self::Matrix(..) | Self::Named(_) => true,
-            Self::Array(element, _) => element.is_blittable(),
+            Self::Array(element, _) | Self::RuntimeArray(element) => element.is_blittable(),
         }
     }
 
@@ -245,7 +254,7 @@ impl Ty {
     fn named(&self) -> Vec<&str> {
         match self {
             Self::Named(key) => vec![key.as_str()],
-            Self::Array(element, _) => element.named(),
+            Self::Array(element, _) | Self::RuntimeArray(element) => element.named(),
             _ => Vec::new(),
         }
     }
@@ -284,7 +293,8 @@ struct PodMember {
     name: String,
     /// Offset from the start of the struct, in bytes.
     offset: u32,
-    /// The size of the field, in bytes.
+    /// The size of the field, in bytes. For a runtime-sized array, which has
+    /// no size, this is the stride between its elements.
     size: u32,
     /// The type of the field.
     ty: Ty,
@@ -297,6 +307,20 @@ struct PodLayout {
     size: u32,
     /// The members of the struct, in order.
     members: Vec<PodMember>,
+}
+
+impl PodLayout {
+    /// Whether the struct ends in a runtime-sized array, and so has no fixed
+    /// size.
+    fn is_unsized(&self) -> bool {
+        matches!(
+            self.members.last(),
+            Some(PodMember {
+                ty: Ty::RuntimeArray(_),
+                ..
+            })
+        )
+    }
 }
 
 /// Information about the shader package that all of the conversion code needs.
@@ -349,7 +373,8 @@ fn render_replacement(
     layout: Option<&PodLayout>,
 ) -> proc_macro2::TokenStream {
     match layout {
-        Some(layout) => {
+        // A replacement for a dynamically-sized struct has no size to check.
+        Some(layout) if !layout.is_unsized() => {
             let size = layout.size as usize;
             let message = format!(
                 "the replacement for `{}` does not have the same size as the WESL struct",
@@ -361,7 +386,7 @@ fn render_replacement(
                 };
             }
         }
-        None => proc_macro2::TokenStream::new(),
+        _ => proc_macro2::TokenStream::new(),
     }
 }
 
@@ -667,8 +692,17 @@ impl<'a> Context<'a> {
             return Ty::Matrix(columns, rows, scalar_arg());
         }
 
+        if name == "atomic" {
+            // Naga rejects element types that cannot be atomic.
+            return Ty::Scalar(scalar_arg());
+        }
+
         if name == "array" {
             let element = arg_type(0);
+            if args.len() == 1 {
+                return Ty::RuntimeArray(Box::new(element));
+            }
+
             let length = match args.get(1).map(|arg| &*arg.expression) {
                 Some(wesl::syntax::Expression::Literal(LiteralExpression::AbstractInt(n))) => {
                     *n as u32
@@ -677,7 +711,7 @@ impl<'a> Context<'a> {
                 Some(wesl::syntax::Expression::Literal(LiteralExpression::I32(n))) => *n as u32,
                 _ => fail_in(
                     owner,
-                    "array lengths in structs that are not blittable must be integer literals (runtime-sized arrays cannot be exported)",
+                    "array lengths in structs that are not blittable must be integer literals",
                 ),
             };
             return Ty::Array(Box::new(element), length);
@@ -703,6 +737,7 @@ impl<'a> Context<'a> {
                 *rows as u8,
                 Prim::from_naga(*scalar)?,
             )),
+            TypeInner::Atomic(scalar) => Some(Ty::Scalar(Prim::from_naga(*scalar)?)),
             TypeInner::Array {
                 base,
                 size: ArraySize::Constant(length),
@@ -711,6 +746,11 @@ impl<'a> Context<'a> {
                 Box::new(self.naga_type(module, *base)?),
                 length.get(),
             )),
+            TypeInner::Array {
+                base,
+                size: ArraySize::Dynamic,
+                ..
+            } => Some(Ty::RuntimeArray(Box::new(self.naga_type(module, *base)?))),
             TypeInner::Struct { .. } => {
                 let name = module.types[ty].name.as_deref().unwrap_or_default();
                 self.item_key(name).map(Ty::Named)
@@ -834,10 +874,20 @@ impl<'a> Context<'a> {
                 return None;
             }
 
+            // Runtime-sized arrays are described by their stride.
+            let size = match module.types[member.ty].inner {
+                TypeInner::Array {
+                    size: ArraySize::Dynamic,
+                    stride,
+                    ..
+                } => stride,
+                _ => layouter[member.ty].size,
+            };
+
             result.push(PodMember {
                 name: member.name.clone().unwrap_or_default(),
                 offset: member.offset,
-                size: layouter[member.ty].size,
+                size,
                 ty,
             });
         }
@@ -891,6 +941,10 @@ impl<'a> Context<'a> {
                 let element = self.render_type(export, element, exports, pod);
                 let length = *length as usize;
                 quote::quote!([#element; #length])
+            }
+            Ty::RuntimeArray(element) => {
+                let element = self.render_type(export, element, exports, pod);
+                quote::quote!([#element])
             }
             Ty::Named(key) => {
                 if let Some(replacement) = self.options.external_types.get(key) {
@@ -973,56 +1027,108 @@ impl<'a> Context<'a> {
                     "field `{}` of `{}` does not match the layout of the WESL struct",
                     member.name, export.key
                 );
-                assertions.push(quote::quote! {
-                    ::core::assert!(::core::mem::offset_of!(#name, #field) == #offset, #message);
-                    ::core::assert!(::core::mem::size_of::<#ty>() == #size, #message);
+                assertions.push(match &member.ty {
+                    // `offset_of!` cannot be used on a slice. The padding before
+                    // it is explicit, so Rust only has to not add any more.
+                    Ty::RuntimeArray(element) => {
+                        let element = self.render_type(export, element, exports, true);
+                        quote::quote! {
+                            ::core::assert!(#offset % ::core::mem::align_of::<#element>() == 0, #message);
+                            ::core::assert!(::core::mem::size_of::<#element>() == #size, #message);
+                        }
+                    }
+                    _ => quote::quote! {
+                        ::core::assert!(::core::mem::offset_of!(#name, #field) == #offset, #message);
+                        ::core::assert!(::core::mem::size_of::<#ty>() == #size, #message);
+                    },
                 });
             }
-            push_padding(&mut fields, layout.size - cursor);
 
-            let size = layout.size as usize;
-            let message = format!(
-                "`{}` does not have the same size as the WESL struct",
-                export.key
-            );
+            // A struct that ends in a runtime-sized array is dynamically sized,
+            // so it cannot be `Pod` or `Copy`, and has no size to check.
+            let sized = !layout.is_unsized();
+            let (derives, bytemuck, default) = if sized {
+                push_padding(&mut fields, layout.size - cursor);
+
+                let size = layout.size as usize;
+                let message = format!(
+                    "`{}` does not have the same size as the WESL struct",
+                    export.key
+                );
+                assertions.push(quote::quote! {
+                    ::core::assert!(::core::mem::size_of::<#name>() == #size, #message);
+                });
+
+                (
+                    quote::quote!(
+                        ::core::marker::Copy,
+                        ::core::clone::Clone,
+                        ::core::fmt::Debug,
+                        ::include_wesl::bytemuck::Pod,
+                        ::include_wesl::bytemuck::Zeroable
+                    ),
+                    quote::quote!(#[bytemuck(crate = "::include_wesl::bytemuck")]),
+                    quote::quote! {
+                        impl ::core::default::Default for #name {
+                            fn default() -> Self {
+                                ::include_wesl::bytemuck::Zeroable::zeroed()
+                            }
+                        }
+                    },
+                )
+            } else {
+                (
+                    quote::quote!(::core::fmt::Debug),
+                    proc_macro2::TokenStream::new(),
+                    proc_macro2::TokenStream::new(),
+                )
+            };
 
             quote::quote! {
                 #(#docs)*
-                #[derive(::core::marker::Copy, ::core::clone::Clone, ::core::fmt::Debug, ::include_wesl::bytemuck::Pod, ::include_wesl::bytemuck::Zeroable)]
-                #[bytemuck(crate = "::include_wesl::bytemuck")]
+                #[derive(#derives)]
+                #bytemuck
                 #[repr(C)]
                 #[allow(missing_docs, dead_code, clippy::missing_docs_in_private_items)]
                 pub struct #name {
                     #(#fields,)*
                 }
 
-                impl ::core::default::Default for #name {
-                    fn default() -> Self {
-                        ::include_wesl::bytemuck::Zeroable::zeroed()
-                    }
-                }
+                #default
 
                 const _: () = {
-                    ::core::assert!(::core::mem::size_of::<#name>() == #size, #message);
                     #(#assertions)*
                 };
             }
         } else {
             let mut fields = Vec::new();
+            let mut last = None;
             for member in &export.members {
                 let ty = self.tree_type(&export.key, &member.ty);
-                let ty = self.render_type(export, &ty, exports, false);
+                let rendered = self.render_type(export, &ty, exports, false);
+                last = Some(ty);
                 let field = rust_ident(&member.name);
                 let docs = member.docs.iter().map(|line| quote::quote!(#[doc = #line]));
                 fields.push(quote::quote! {
                     #(#docs)*
-                    pub #field: #ty
+                    pub #field: #rendered
                 });
             }
 
+            // Structs with slices at the end cannot be copied.
+            let derives = if matches!(last, Some(Ty::RuntimeArray(_))) {
+                quote::quote!(::core::fmt::Debug)
+            } else {
+                quote::quote!(
+                    ::core::marker::Copy,
+                    ::core::clone::Clone,
+                    ::core::fmt::Debug
+                )
+            };
+
             quote::quote! {
                 #(#docs)*
-                #[derive(::core::marker::Copy, ::core::clone::Clone, ::core::fmt::Debug)]
+                #[derive(#derives)]
                 #[allow(missing_docs, dead_code, clippy::missing_docs_in_private_items)]
                 pub struct #name {
                     #(#fields,)*
