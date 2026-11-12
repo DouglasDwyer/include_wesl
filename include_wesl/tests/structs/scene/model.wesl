@@ -1,5 +1,16 @@
 import package::math::m16;
 
+const BRICK_SIZE: u32 = 4u;
+
+/// The number of voxels in a brick. This is evaluated from other constants.
+@export const BRICK_VOLUME: u32 = BRICK_SIZE * BRICK_SIZE * BRICK_SIZE;
+
+/// The smallest brick scale.
+@export const MIN_SCALE: f32 = 0.25;
+
+/// Whether bricks are compressed.
+@export const COMPRESSED: bool = false;
+
 /// An axis-aligned box.
 ///
 /// Each `vec3f` is padded to 16 bytes.

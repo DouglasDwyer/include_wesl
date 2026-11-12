@@ -1602,14 +1602,18 @@ mod tests {
 
     /// The attribute only makes sense on structs.
     #[test]
-    #[should_panic(expected = "can only be applied to structs, but it is on a function")]
+    #[should_panic(
+        expected = "can only be applied to structs and constants, but it is on a function"
+    )]
     fn test_export_rejects_functions() {
         generate_package("function", &[("package.wesl", "@export fn f() {}")], &[]);
     }
 
     /// Members cannot be exported either.
     #[test]
-    #[should_panic(expected = "can only be applied to structs (found 1 on something else)")]
+    #[should_panic(
+        expected = "can only be applied to structs and constants (found 1 on something else)"
+    )]
     fn test_export_rejects_members() {
         generate_package(
             "member",
@@ -1988,6 +1992,216 @@ mod tests {
             "atomic_float",
             &[("package.wesl", "@export struct A { x: atomic<bool> }")],
             &[],
+        );
+    }
+
+    /// Scalar constants become Rust constants of the same type and value.
+    #[test]
+    fn test_scalar_consts() {
+        let source = "
+            enable f16;
+            @export const A: u32 = 7u;
+            @export const B: i32 = -3i;
+            @export const C: f32 = 0.5f;
+            @export const D: bool = true;
+            @export const E: f16 = 1.5h;
+            @export const F: u64 = 5lu;
+            @export const G: i64 = -5li;
+            @export const H: f64 = 2.25lf;
+        ";
+        let output = generate_package("scalar_consts", &[("package.wesl", source)], &[]);
+        for expected in [
+            "pub const A : u32 = 7u32 ;",
+            "pub const B : i32 = - 3i32 ;",
+            "pub const C : f32 = 0.5f32 ;",
+            "pub const D : bool = true ;",
+            "pub const E : f16 = 1.5 ;",
+            "pub const F : u64 = 5u64 ;",
+            "pub const G : i64 = - 5i64 ;",
+            "pub const H : f64 = 2.25f64 ;",
+        ] {
+            assert!(
+                output.contains(expected),
+                "{expected} missing from {output}"
+            );
+        }
+    }
+
+    /// The initializer is evaluated, including references to other constants.
+    #[test]
+    fn test_consts_are_evaluated() {
+        let source = "
+            const SIZE: u32 = 4u;
+            @export const VOLUME: u32 = SIZE * SIZE * SIZE + 1u;
+            @export const RATIO: f32 = f32(SIZE) / 8.0;
+        ";
+        let output = generate_package("evaluated_consts", &[("package.wesl", source)], &[]);
+        assert!(
+            output.contains("pub const VOLUME : u32 = 65u32 ;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub const RATIO : f32 = 0.5f32 ;"),
+            "{output}"
+        );
+        assert!(!output.contains("SIZE"), "{output}");
+    }
+
+    /// Constants that are not marked `@export` are not generated.
+    #[test]
+    fn test_unmarked_consts_are_not_exported() {
+        let source = "const A: u32 = 1u;\npublic const B: u32 = 2u;\n@export const C: u32 = 3u;";
+        let output = generate_package("unmarked_consts", &[("package.wesl", source)], &[]);
+        assert!(!output.contains("const A"), "{output}");
+        assert!(!output.contains("const B"), "{output}");
+        assert!(output.contains("const C"), "{output}");
+    }
+
+    /// Doc comments are carried over to constants, which live in the module
+    /// that declares them.
+    #[test]
+    fn test_const_docs_and_modules() {
+        let output = generate_package(
+            "const_docs",
+            &[
+                (
+                    "package.wesl",
+                    "import package::inner;\n/// The root.\n@export const A: u32 = 1u;\nfn f() -> u32 { return inner::B; }",
+                ),
+                ("inner.wesl", "/// Inner.\n@export const B: u32 = 2u;"),
+            ],
+            &[],
+        );
+        assert!(output.contains("# [doc = \"The root.\"]"), "{output}");
+        let (root, inner) = output
+            .split_once("pub mod inner")
+            .expect("module generated");
+        assert!(root.contains("const A"), "{output}");
+        assert!(inner.contains("# [doc = \"Inner.\"]"), "{output}");
+        assert!(inner.contains("pub const B : u32 = 2u32 ;"), "{output}");
+    }
+
+    /// Constants can share a name with a struct in another module, and
+    /// constants may be exported next to structs.
+    #[test]
+    fn test_consts_and_structs_together() {
+        let source = "@export struct A { x: u32 }\n@export const SIZE: u32 = 4u;";
+        let output = generate_package("consts_and_structs", &[("package.wesl", source)], &[]);
+        assert!(output.contains("pub struct A"), "{output}");
+        assert!(output.contains("pub const SIZE : u32 = 4u32 ;"), "{output}");
+    }
+
+    /// Overrides are only known when the pipeline is created, and variables
+    /// have no value at compile time.
+    #[test]
+    #[should_panic(expected = "but it is on a override declaration")]
+    fn test_export_rejects_overrides() {
+        generate_package(
+            "override",
+            &[("package.wesl", "@export override x: u32 = 1u;")],
+            &[],
+        );
+    }
+
+    /// Variables cannot be exported.
+    #[test]
+    #[should_panic(expected = "but it is on a variable")]
+    fn test_export_rejects_variables() {
+        generate_package(
+            "variable",
+            &[("package.wesl", "@export var<private> x: u32 = 1u;")],
+            &[],
+        );
+    }
+
+    /// Naga does not keep constants of an abstract type, so they are an error
+    /// instead of being silently dropped.
+    #[test]
+    #[should_panic(expected = "give it a type")]
+    fn test_abstract_consts_need_a_type() {
+        generate_package("abstract", &[("package.wesl", "@export const A = 1;")], &[]);
+    }
+
+    /// Constants that are not scalars are not supported yet.
+    #[test]
+    #[should_panic(expected = "can be exported")]
+    fn test_non_scalar_consts_are_rejected() {
+        generate_package(
+            "non_scalar",
+            &[("package.wesl", "@export const A: vec2u = vec2u(1u, 2u);")],
+            &[],
+        );
+    }
+
+    /// A constant has to have a single value in Rust.
+    #[test]
+    #[should_panic(expected = "different value or type in different variants")]
+    fn test_variant_dependent_consts_are_rejected() {
+        let source = "
+            @if(wide) const N: u32 = 1u;
+            @if(!wide) const N: u32 = 2u;
+            @export const K: u32 = N;
+        ";
+        generate_package("variant_const", &[("package.wesl", source)], &[]);
+    }
+
+    /// A constant whose type changes is also variant-dependent.
+    #[test]
+    #[should_panic(expected = "different value or type in different variants")]
+    fn test_variant_dependent_const_types_are_rejected() {
+        let source = "
+            @if(half) enable f16;
+            @if(half) alias m16 = f16;
+            @if(!half) alias m16 = f32;
+            @export const K: m16 = 1.0;
+        ";
+        generate_package("variant_const_type", &[("package.wesl", source)], &[]);
+    }
+
+    /// Conditional translation cannot be applied to the constant itself.
+    #[test]
+    #[should_panic(expected = "conditional translation on exported constants is not supported")]
+    fn test_conditional_consts_are_rejected() {
+        generate_package(
+            "conditional_const",
+            &[("package.wesl", "@if(a) @export const A: u32 = 1u;")],
+            &[],
+        );
+    }
+
+    /// A constant in a module that is only imported in some variants is
+    /// generated once.
+    #[test]
+    fn test_consts_missing_from_some_variants_are_exported() {
+        let output = generate_package(
+            "conditional_module_const",
+            &[
+                ("package.wesl", CONDITIONAL_MODULE_SOURCE),
+                (
+                    "sw.wesl",
+                    "@export struct B { x: u32 }\n@export const K: u32 = 4u;",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.matches("pub const K : u32 = 4u32 ;").count(),
+            1,
+            "{output}"
+        );
+    }
+
+    /// The constants in the fixture are in the modules that declare them.
+    #[test]
+    fn test_fixture_consts() {
+        let output = generate_fixture(&fixture_options());
+        assert!(
+            output.contains("pubconstHEADER_MAGIC:u32=1296123721u32;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pubconstBRICK_VOLUME:u32=64u32;"),
+            "{output}"
         );
     }
 
