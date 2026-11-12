@@ -95,3 +95,19 @@ fn atomics_and_slices_use_arrays() {
         24
     );
 }
+
+/// Vectors and matrices are arrays, and the columns of `mat3x3f` are padded in
+/// structs but not on their own.
+#[test]
+fn consts_use_arrays() {
+    use scene::model::{IDENTITY, SCALE, SPIN, UP, WORLD_BOUNDS};
+
+    assert_eq!(UP, [0.0, 1.0, 0.0]);
+    assert_eq!(
+        IDENTITY,
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+    );
+    assert_eq!(SCALE, [[2.0, 0.0], [0.0, 3.0]]);
+    assert_eq!(SPIN.basis[1], [-1.0, 0.0, 0.0, 0.0]);
+    assert_eq!(WORLD_BOUNDS.max, [1.0, 2.0, 3.0]);
+}

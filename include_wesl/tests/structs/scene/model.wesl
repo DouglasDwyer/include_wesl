@@ -93,6 +93,48 @@ alias Handles = array<Handle>;
     ids: array<u32>
 }
 
+/// Not blittable, but it can still be a constant.
+@export struct Flags {
+    enabled: bool,
+    mask: vec2u
+}
+
+/// A vector constant.
+@export const UP: vec3f = vec3f(0.0, 1.0, 0.0);
+
+/// A splatted vector.
+@export const ONES: vec2u = vec2u(1u);
+
+/// A matrix constant. The columns are padded when it is in a struct.
+@export const IDENTITY: mat3x3f = mat3x3f(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+
+/// A matrix with no padding.
+@export const SCALE: mat2x2f = mat2x2f(2.0, 0.0, 0.0, 3.0);
+
+/// An array of scalars.
+@export const PRIMES: array<u32, 4> = array<u32, 4>(2u, 3u, 5u, 7u);
+
+/// An array that is all one value.
+@export const NO_OFFSETS: array<vec2i, 8> = array<vec2i, 8>();
+
+/// A blittable struct, which has padding between its fields.
+@export const WORLD_BOUNDS: Aabb = Aabb(vec3f(-1.0, -2.0, -3.0), vec3f(1.0, 2.0, 3.0));
+
+/// A struct with every field zero.
+@export const EMPTY_BOUNDS: Aabb = Aabb();
+
+/// A struct that contains an array and a matrix.
+@export const SPIN: Rotation = Rotation(
+    mat3x3f(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0),
+    0.5
+);
+
+/// A struct that contains another struct.
+@export const FULL_BOUNDS: Bounds = Bounds(array<u32, 3>(4u, 4u, 4u));
+
+/// A struct that is not blittable.
+@export const DEFAULT_FLAGS: Flags = Flags(true, vec2u(3u, 5u));
+
 /// Gives the main module something to use, so that this module is loaded.
 fn touch() {
 }
