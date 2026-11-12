@@ -2534,15 +2534,201 @@ mod tests {
         generate_package("abstract", &[("package.wesl", "@export const A = 1;")], &[]);
     }
 
-    /// Constants that are not scalars are not supported yet.
+    /// Vectors and matrices are arrays by default, and splats and zero values
+    /// are expanded.
     #[test]
-    #[should_panic(expected = "can be exported")]
-    fn test_non_scalar_consts_are_rejected() {
-        generate_package(
-            "non_scalar",
-            &[("package.wesl", "@export const A: vec2u = vec2u(1u, 2u);")],
+    fn test_vector_and_matrix_consts_are_arrays() {
+        let source = "
+            @export const A: vec3f = vec3f(1.0, 2.0, 3.0);
+            @export const B: vec2u = vec2u(7u);
+            @export const C: mat2x3f = mat2x3f();
+            @export const D: vec2<bool> = vec2<bool>(true, false);
+        ";
+        let output = generate_package_with(
+            "array_consts",
+            &[("package.wesl", source)],
+            VectorTypes::Array,
             &[],
         );
+        for expected in [
+            "pub const A : [f32 ; 3usize] = [1f32 , 2f32 , 3f32] ;",
+            "pub const B : [u32 ; 2usize] = [7u32 , 7u32] ;",
+            "pub const C : [[f32 ; 3usize] ; 2usize] = [[0f32 , 0f32 , 0f32] , [0f32 , 0f32 , 0f32]] ;",
+            "pub const D : [bool ; 2usize] = [true , false] ;",
+        ] {
+            assert!(
+                output.contains(expected),
+                "{expected} missing from {output}"
+            );
+        }
+    }
+
+    /// With `glam`, constants use its constructors, which are `const`.
+    #[test]
+    fn test_glam_consts() {
+        let source = "
+            @export const A: vec3f = vec3f(1.0, 2.0, 3.0);
+            @export const B: mat2x2f = mat2x2f(1.0, 0.0, 0.0, 1.0);
+            @export const C: mat3x3f = mat3x3f();
+            @export const D: vec2<bool> = vec2<bool>(true, false);
+        ";
+        let output = generate_package("glam_consts", &[("package.wesl", source)], &[]);
+        for expected in [
+            "pub const A : :: include_wesl :: glam :: Vec3 = :: include_wesl :: glam :: Vec3 :: new (1f32 , 2f32 , 3f32) ;",
+            "pub const B : :: include_wesl :: glam :: Mat2 = :: include_wesl :: glam :: Mat2 :: from_cols (:: include_wesl :: glam :: Vec2 :: new (1f32 , 0f32) , :: include_wesl :: glam :: Vec2 :: new (0f32 , 1f32)) ;",
+            "pub const C : :: include_wesl :: glam :: Mat3 = :: include_wesl :: glam :: Mat3 :: from_cols",
+            ":: include_wesl :: glam :: BVec2 :: new (true , false)",
+        ] {
+            assert!(
+                output.contains(expected),
+                "{expected} missing from {output}"
+            );
+        }
+    }
+
+    /// Arrays are written out, unless they repeat one value.
+    #[test]
+    fn test_array_consts() {
+        let source = "
+            @export const A: array<u32, 3> = array<u32, 3>(1u, 2u, 3u);
+            @export const B: array<u32, 3> = array<u32, 3>();
+            @export const C: array<array<f32, 2>, 2> = array<array<f32, 2>, 2>(array<f32, 2>(1.0, 2.0), array<f32, 2>(1.0, 2.0));
+        ";
+        let output = generate_package_with(
+            "array_values",
+            &[("package.wesl", source)],
+            VectorTypes::Array,
+            &[],
+        );
+        assert!(
+            output.contains("pub const A : [u32 ; 3usize] = [1u32 , 2u32 , 3u32] ;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub const B : [u32 ; 3usize] = [0u32 ; 3usize] ;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub const C : [[f32 ; 2usize] ; 2usize] = [[1f32 , 2f32] ; 2usize] ;"),
+            "{output}"
+        );
+    }
+
+    /// Blittable structs get their padding in the literal, matching the
+    /// definition.
+    #[test]
+    fn test_struct_consts_include_padding() {
+        let source = "
+            @export struct A { x: u32, y: vec2u, z: u32 }
+            @export const K: A = A(1u, vec2u(2u, 3u), 4u);
+        ";
+        let output = generate_package_with(
+            "struct_padding",
+            &[("package.wesl", source)],
+            VectorTypes::Array,
+            &[],
+        );
+        assert!(output.contains("pub _padding0 : [u8 ; 4usize]"), "{output}");
+        assert!(output.contains("pub _padding1 : [u8 ; 4usize]"), "{output}");
+        assert!(
+            output.contains(
+                "pub const K : self :: A = self :: A { x : 1u32 , _padding0 : [0u8 ; 4usize] , y : [2u32 , 3u32] , z : 4u32 , _padding1 : [0u8 ; 4usize] } ;"
+            ),
+            "{output}"
+        );
+    }
+
+    /// Structs that are not blittable have no padding to fill in.
+    #[test]
+    fn test_plain_struct_consts() {
+        let source = "
+            @export struct A { x: bool, y: u32 }
+            @export const K: A = A(true, 4u);
+        ";
+        let output = generate_package("plain_struct_const", &[("package.wesl", source)], &[]);
+        assert!(
+            output.contains("pub const K : self :: A = self :: A { x : true , y : 4u32 } ;"),
+            "{output}"
+        );
+        assert!(!output.contains("padding"), "{output}");
+    }
+
+    /// A struct constant refers to the struct by its path from the module.
+    #[test]
+    fn test_struct_consts_in_other_modules() {
+        let output = generate_package(
+            "struct_const_paths",
+            &[
+                (
+                    "package.wesl",
+                    "import package::inner;\n@export struct A { x: u32 }\nfn f() -> u32 { return inner::K.b.x; }",
+                ),
+                (
+                    "inner.wesl",
+                    "import package::A;\n@export struct B { x: u32 }\n@export const K: Pair = Pair(A(1u), B(2u));\n@export struct Pair { a: A, b: B }",
+                ),
+            ],
+            &[],
+        );
+        assert!(output.contains("super :: A { x : 1u32 }"), "{output}");
+        assert!(output.contains("self :: B { x : 2u32 }"), "{output}");
+    }
+
+    /// The struct has to be exported to have a Rust definition.
+    #[test]
+    #[should_panic(expected = "`A` is not exported")]
+    fn test_struct_consts_need_exported_structs() {
+        generate_package(
+            "unexported_struct_const",
+            &[(
+                "package.wesl",
+                "struct A { x: u32 }\n@export const K: A = A(1u);",
+            )],
+            &[],
+        );
+    }
+
+    /// The fields of a replaced struct are unknown, so a value cannot be written.
+    #[test]
+    #[should_panic(expected = "which the `external_types` option replaces")]
+    fn test_struct_consts_cannot_use_replaced_structs() {
+        generate_package(
+            "replaced_struct_const",
+            &[(
+                "package.wesl",
+                "@export struct A { x: u32 }\n@export const K: A = A(1u);",
+            )],
+            &[("A", syn::parse_quote!([u32; 1]))],
+        );
+    }
+
+    /// Structs that contain a replaced struct cannot have values either.
+    #[test]
+    #[should_panic(expected = "which the `external_types` option replaces")]
+    fn test_struct_consts_cannot_contain_replaced_structs() {
+        let source = "
+            struct H { x: u32 }
+            @export struct A { h: H }
+            @export const K: A = A(H(1u));
+        ";
+        generate_package(
+            "replaced_field_const",
+            &[("package.wesl", source)],
+            &[("H", syn::parse_quote!(u32))],
+        );
+    }
+
+    /// Everything in a struct constant has to agree between variants.
+    #[test]
+    #[should_panic(expected = "different value or type in different variants")]
+    fn test_struct_consts_must_agree_between_variants() {
+        let source = "
+            @if(wide) const N: u32 = 1u;
+            @if(!wide) const N: u32 = 2u;
+            @export struct A { x: u32 }
+            @export const K: A = A(N);
+        ";
+        generate_package("variant_struct_const", &[("package.wesl", source)], &[]);
     }
 
     /// A constant has to have a single value in Rust.
@@ -2645,6 +2831,16 @@ mod tests {
     /// Creates a package in a fresh temporary directory and generates code
     /// for it with the fixture options (apart from the paths).
     fn generate_package(name: &str, files: &[(&str, &str)], types: &[(&str, syn::Type)]) -> String {
+        generate_package_with(name, files, VectorTypes::Glam, types)
+    }
+
+    /// Like [`generate_package`], but chooses the types of vectors and matrices.
+    fn generate_package_with(
+        name: &str,
+        files: &[(&str, &str)],
+        vector_types: VectorTypes,
+        types: &[(&str, syn::Type)],
+    ) -> String {
         let directory = TempDirectory(std::env::temp_dir().join(format!(
             "include_wesl_structs_{}_{name}",
             std::process::id()
@@ -2656,7 +2852,7 @@ mod tests {
         }
 
         let mut options = parse(quote::quote!("unused"));
-        options.vector_types = VectorTypes::Glam;
+        options.vector_types = vector_types;
         options.external_types.extend(
             types
                 .iter()

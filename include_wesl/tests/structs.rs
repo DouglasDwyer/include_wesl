@@ -225,3 +225,72 @@ fn consts_are_usable_in_const_contexts() {
     const WORDS: [u32; BRICK_VOLUME as usize] = [0; BRICK_VOLUME as usize];
     assert_eq!(WORDS.len(), 64);
 }
+
+/// Vector constants are `glam` types, and splats are expanded.
+#[test]
+fn vector_consts() {
+    use scene::model::{ONES, UP};
+
+    assert_eq!(UP, ::include_wesl::glam::Vec3::new(0.0, 1.0, 0.0));
+    assert_eq!(ONES, ::include_wesl::glam::UVec2::new(1, 1));
+}
+
+/// Matrix constants use `glam` types as well, in columns.
+#[test]
+fn matrix_consts() {
+    use ::include_wesl::glam::{Mat2, Mat3};
+    use scene::model::{IDENTITY, SCALE};
+
+    assert_eq!(IDENTITY, Mat3::IDENTITY);
+    assert_eq!(
+        SCALE,
+        Mat2::from_diagonal(::include_wesl::glam::Vec2::new(2.0, 3.0))
+    );
+}
+
+/// Array constants are arrays, including ones with repeated elements.
+#[test]
+fn array_consts() {
+    use scene::model::{NO_OFFSETS, PRIMES};
+
+    assert_eq!(PRIMES, [2, 3, 5, 7]);
+    assert_eq!(NO_OFFSETS, [::include_wesl::glam::IVec2::ZERO; 8]);
+}
+
+/// Struct constants include the explicit padding, so their bytes match the
+/// shader's.
+#[test]
+fn blittable_struct_consts() {
+    use scene::model::{EMPTY_BOUNDS, FULL_BOUNDS, SPIN, WORLD_BOUNDS};
+
+    let words = cast_slice::<u8, f32>(bytes_of(&WORLD_BOUNDS));
+    assert_eq!(words, [-1.0, -2.0, -3.0, 0.0, 1.0, 2.0, 3.0, 0.0]);
+    assert_eq!(bytes_of(&EMPTY_BOUNDS), [0; 32]);
+    assert_eq!(FULL_BOUNDS.inner, [4, 4, 4]);
+
+    // `Vec3A` decides what goes in its padding lane, so only the columns and
+    // the field after them are checked.
+    assert_eq!(
+        SPIN.basis.to_cols_array_2d(),
+        [[0.0, 1.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    );
+    assert_eq!(SPIN.scale, 0.5);
+}
+
+/// Structs that are not blittable can be constants too.
+#[test]
+fn plain_struct_consts() {
+    use scene::model::DEFAULT_FLAGS;
+
+    const { assert!(DEFAULT_FLAGS.enabled) };
+    assert_eq!(DEFAULT_FLAGS.mask, ::include_wesl::glam::UVec2::new(3, 5));
+}
+
+/// Struct constants can be used to build other constants.
+#[test]
+fn struct_consts_are_const_expressions() {
+    use scene::model::WORLD_BOUNDS;
+
+    const WIDTH: f32 = WORLD_BOUNDS.max.x - WORLD_BOUNDS.min.x;
+    assert_eq!(WIDTH, 2.0);
+}
