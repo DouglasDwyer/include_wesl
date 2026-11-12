@@ -30,7 +30,10 @@
 // A `const` marked `@export` becomes a Rust `const` with the same value. Naga
 // has already evaluated the initializer by the time it reaches this module, so
 // the value is emitted whole, not as an expression that refers to other
-// constants. The value has to be the same in every feature variant of the
+// constants. Scalars, vectors, matrices, arrays and structs are supported. A
+// struct has to be exported itself (and not replaced by the caller), since
+// the value is written as a literal of the generated struct, with any explicit
+// padding. The value has to be the same in every feature variant of the
 // shader where the constant exists. Naga drops constants of an abstract type
 // (like `const A = 1;`) since they only exist at their uses, so the type has
 // to be written out (`const A: u32 = 1;`).
@@ -379,6 +382,68 @@ impl Lit {
     }
 }
 
+impl Lit {
+    /// The zero value of `prim`.
+    fn zero(prim: Prim) -> Self {
+        match prim {
+            Prim::Bool => Self::Bool(false),
+            Prim::F16 => Self::F16(0),
+            Prim::F32 => Self::F32(0),
+            Prim::F64 => Self::F64(0),
+            Prim::I32 => Self::I32(0),
+            Prim::I64 => Self::I64(0),
+            Prim::U32 => Self::U32(0),
+            Prim::U64 => Self::U64(0),
+        }
+    }
+}
+
+/// The value of a constant, with every expression in it evaluated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Value {
+    /// A scalar.
+    Scalar(Lit),
+    /// A vector with the given elements.
+    Vector(Vec<Lit>),
+    /// A matrix, as a list of columns.
+    Matrix(Vec<Vec<Lit>>),
+    /// An array with the given elements.
+    Array(Vec<Value>),
+    /// A struct, with its members in order.
+    Struct {
+        /// The path of the struct from the package root.
+        key: String,
+        /// The names and values of the members.
+        members: Vec<(String, Value)>,
+    },
+}
+
+impl Value {
+    /// The type of the value.
+    fn ty(&self) -> Ty {
+        match self {
+            Self::Scalar(lit) => Ty::Scalar(lit.prim()),
+            Self::Vector(lits) => Ty::Vector(lits.len() as u8, lits[0].prim()),
+            Self::Matrix(columns) => Ty::Matrix(
+                columns.len() as u8,
+                columns[0].len() as u8,
+                columns[0][0].prim(),
+            ),
+            Self::Array(elements) => Ty::Array(Box::new(elements[0].ty()), elements.len() as u32),
+            Self::Struct { key, .. } => Ty::Named(key.clone()),
+        }
+    }
+
+    /// Whether the value contains a struct anywhere.
+    fn has_struct(&self) -> bool {
+        match self {
+            Self::Struct { .. } => true,
+            Self::Array(elements) => elements.iter().any(Self::has_struct),
+            _ => false,
+        }
+    }
+}
+
 /// A member of an [`ExportedStruct`].
 struct ExportedMember {
     /// The name of the field.
@@ -470,25 +535,12 @@ pub fn generate(shader_path: &Path, options: &Options) -> (proc_macro2::TokenStr
     }
     for export in &exports.consts {
         if let Some(value) = values.get(&export.mangled) {
-            root.insert(&export.module.components, render_const(export, *value));
+            let tokens = context.render_const(export, value, &exports.structs, &layouts);
+            root.insert(&export.module.components, tokens);
         }
     }
 
     (root.render(&[]), files)
-}
-
-/// Writes the definition of an exported constant.
-fn render_const(export: &ExportedConst, value: Lit) -> proc_macro2::TokenStream {
-    let name = rust_ident(&export.name);
-    let docs = export.docs.iter().map(|line| quote::quote!(#[doc = #line]));
-    let ty = value.prim().tokens();
-    let value = value.tokens();
-
-    quote::quote! {
-        #(#docs)*
-        #[allow(non_upper_case_globals, missing_docs, dead_code, clippy::missing_docs_in_private_items)]
-        pub const #name: #ty = #value;
-    }
 }
 
 /// Writes the checks for an exported struct that the caller replaced with a
@@ -1021,8 +1073,12 @@ impl<'a> Context<'a> {
     /// value in the ones that define it. It must be defined in at least one.
     ///
     /// The result is keyed by the name of the constant in the compiled shader.
-    fn const_values(&self, modules: &[Module], exports: &[ExportedConst]) -> HashMap<String, Lit> {
-        let mut result = HashMap::<String, Lit>::new();
+    fn const_values(
+        &self,
+        modules: &[Module],
+        exports: &[ExportedConst],
+    ) -> HashMap<String, Value> {
+        let mut result = HashMap::<String, Value>::new();
 
         for module in modules {
             for export in exports {
@@ -1030,12 +1086,9 @@ impl<'a> Context<'a> {
                     continue;
                 };
 
-                let Some(value) = const_value(module, module.constants[handle].init) else {
-                    fail_in(
-                        &export.key,
-                        "only constants of a scalar type (`bool`, `i32`, `u32`, `f32`, `f16`, `i64`, `u64` or `f64`) can be exported",
-                    );
-                };
+                let value = self
+                    .const_value(module, module.constants[handle].init)
+                    .unwrap_or_else(|reason| fail_in(&export.key, reason));
 
                 match result.get(&export.mangled) {
                     None => {
@@ -1061,6 +1114,278 @@ impl<'a> Context<'a> {
         }
 
         result
+    }
+
+    /// Gets the value of the constant expression `expression`, which Naga has
+    /// already evaluated. On failure, returns the reason.
+    fn const_value(
+        &self,
+        module: &Module,
+        expression: Handle<naga::Expression>,
+    ) -> std::result::Result<Value, String> {
+        match &module.global_expressions[expression] {
+            naga::Expression::Literal(literal) => Lit::from_naga(*literal)
+                .map(Value::Scalar)
+                .ok_or_else(|| "the constant has a type that has no Rust equivalent".to_string()),
+            naga::Expression::Constant(constant) => {
+                self.const_value(module, module.constants[*constant].init)
+            }
+            naga::Expression::ZeroValue(ty) => self.zero_value(module, *ty),
+            naga::Expression::Splat { size, value } => {
+                let Value::Scalar(lit) = self.const_value(module, *value)? else {
+                    return Err("a vector was built from something other than a scalar".into());
+                };
+                Ok(Value::Vector(vec![lit; *size as usize]))
+            }
+            naga::Expression::Compose { ty, components } => {
+                let values = components
+                    .iter()
+                    .map(|component| self.const_value(module, *component))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+                match &module.types[*ty].inner {
+                    TypeInner::Vector { .. } => Ok(Value::Vector(scalars(values)?)),
+                    TypeInner::Matrix { rows, .. } => {
+                        // The columns are vectors, but they might have been
+                        // written as scalars.
+                        let rows = *rows as usize;
+                        Ok(Value::Matrix(
+                            scalars(values)?.chunks(rows).map(<[Lit]>::to_vec).collect(),
+                        ))
+                    }
+                    TypeInner::Array { .. } => Ok(Value::Array(values)),
+                    TypeInner::Struct { members, .. } => {
+                        let name = module.types[*ty].name.as_deref().unwrap_or_default();
+                        let key = self.item_key(name).ok_or_else(|| {
+                            format!("the constant has the struct type `{name}`, which is not part of the package")
+                        })?;
+                        let names = members
+                            .iter()
+                            .map(|member| member.name.clone().unwrap_or_default());
+                        Ok(Value::Struct {
+                            key,
+                            members: names.zip(values).collect(),
+                        })
+                    }
+                    _ => Err("the constant has a type that has no Rust equivalent".into()),
+                }
+            }
+            _ => Err("the constant has a value that is not a constant expression".into()),
+        }
+    }
+
+    /// Gets the zero value of the type `ty`, which a constant of that type
+    /// might be initialized with.
+    fn zero_value(&self, module: &Module, ty: Handle<Type>) -> std::result::Result<Value, String> {
+        let zero = |scalar: Scalar| {
+            Prim::from_naga(scalar)
+                .map(Lit::zero)
+                .ok_or_else(|| "the constant has a type that has no Rust equivalent".to_string())
+        };
+
+        match &module.types[ty].inner {
+            TypeInner::Scalar(scalar) => Ok(Value::Scalar(zero(*scalar)?)),
+            TypeInner::Vector { size, scalar } => {
+                Ok(Value::Vector(vec![zero(*scalar)?; *size as usize]))
+            }
+            TypeInner::Matrix {
+                columns,
+                rows,
+                scalar,
+            } => Ok(Value::Matrix(vec![
+                vec![zero(*scalar)?; *rows as usize];
+                *columns as usize
+            ])),
+            TypeInner::Array {
+                base,
+                size: ArraySize::Constant(length),
+                ..
+            } => Ok(Value::Array(vec![
+                self.zero_value(module, *base)?;
+                length.get() as usize
+            ])),
+            TypeInner::Struct { members, .. } => {
+                let name = module.types[ty].name.as_deref().unwrap_or_default();
+                let key = self.item_key(name).ok_or_else(|| {
+                    format!("the constant has the struct type `{name}`, which is not part of the package")
+                })?;
+                let members = members
+                    .iter()
+                    .map(|member| {
+                        Ok((
+                            member.name.clone().unwrap_or_default(),
+                            self.zero_value(module, member.ty)?,
+                        ))
+                    })
+                    .collect::<std::result::Result<_, String>>()?;
+                Ok(Value::Struct { key, members })
+            }
+            _ => Err("the constant has a type that has no Rust equivalent".into()),
+        }
+    }
+
+    /// Writes the definition of an exported constant.
+    fn render_const(
+        &self,
+        export: &ExportedConst,
+        value: &Value,
+        exports: &[ExportedStruct],
+        layouts: &HashMap<String, PodLayout>,
+    ) -> proc_macro2::TokenStream {
+        let owner = export.owner();
+        let name = rust_ident(&export.name);
+        let docs = export.docs.iter().map(|line| quote::quote!(#[doc = #line]));
+        let expression = self.render_value(&owner, value, exports, layouts, false);
+        let ty = self.render_type(&owner, &value.ty(), exports, false);
+
+        quote::quote! {
+            #(#docs)*
+            #[allow(non_upper_case_globals, missing_docs, dead_code, clippy::missing_docs_in_private_items)]
+            pub const #name: #ty = #expression;
+        }
+    }
+
+    /// Writes a Rust expression for `value`, that has the type that
+    /// [`Self::render_type`] gives. `pod` is whether the value is part of a
+    /// blittable struct.
+    fn render_value(
+        &self,
+        owner: &Owner,
+        value: &Value,
+        exports: &[ExportedStruct],
+        layouts: &HashMap<String, PodLayout>,
+        pod: bool,
+    ) -> proc_macro2::TokenStream {
+        let glam = self.options.vector_types == VectorTypes::Glam;
+        let list = |lits: &[Lit]| {
+            let items = lits.iter().map(|lit| lit.tokens());
+            quote::quote!(#(#items),*)
+        };
+
+        match value {
+            Value::Scalar(lit) => lit.tokens(),
+            Value::Vector(lits) => {
+                let prefix = lits[0].prim().glam_vector_prefix().filter(|_| glam);
+                match prefix {
+                    Some(prefix) => {
+                        let name = quote::format_ident!("{prefix}Vec{}", lits.len());
+                        let items = list(lits);
+                        quote::quote!(::include_wesl::glam::#name::new(#items))
+                    }
+                    None => {
+                        let items = list(lits);
+                        quote::quote!([#items])
+                    }
+                }
+            }
+            Value::Matrix(columns) => {
+                let rows = columns[0].len();
+                let prim = columns[0][0].prim();
+                let glam_name =
+                    glam_matrix(columns.len() as u8, rows as u8, prim, pod).filter(|_| glam);
+
+                match glam_name {
+                    Some(name) => {
+                        // `Mat3A` is built from `Vec3A`, and the others from
+                        // the vector type with the same prefix.
+                        let column = quote::format_ident!("{}", name.replace("Mat", "Vec"));
+                        let name = quote::format_ident!("{name}");
+                        let columns = columns.iter().map(|lits| {
+                            let items = list(lits);
+                            quote::quote!(::include_wesl::glam::#column::new(#items))
+                        });
+                        quote::quote!(::include_wesl::glam::#name::from_cols(#(#columns),*))
+                    }
+                    None => {
+                        let columns = columns.iter().map(|lits| {
+                            let mut lits = lits.clone();
+                            // Blittable structs expose the padding of a column.
+                            if pod && rows == 3 {
+                                lits.push(Lit::zero(prim));
+                            }
+                            let items = list(&lits);
+                            quote::quote!([#items])
+                        });
+                        quote::quote!([#(#columns),*])
+                    }
+                }
+            }
+            Value::Array(elements) => {
+                let first = &elements[0];
+                // Structs are not necessarily `Copy`, so they have to be written
+                // out every time.
+                if elements.len() > 1 && !first.has_struct() && elements.iter().all(|e| e == first)
+                {
+                    let element = self.render_value(owner, first, exports, layouts, pod);
+                    let length = elements.len();
+                    quote::quote!([#element; #length])
+                } else {
+                    let elements = elements
+                        .iter()
+                        .map(|element| self.render_value(owner, element, exports, layouts, pod));
+                    quote::quote!([#(#elements),*])
+                }
+            }
+            Value::Struct { key, members } => {
+                if self.options.external_types.contains_key(key) {
+                    fail_in(
+                        owner.key,
+                        format!(
+                            "the constant contains a value of `{key}`, which the `external_types` option replaces, so its fields are not known"
+                        ),
+                    );
+                }
+
+                let target = find_export(owner, exports, key);
+                let path = struct_path(owner, target);
+                let value_of = |name: &str| {
+                    members
+                        .iter()
+                        .find(|(member, _)| member == name)
+                        .map(|(_, value)| value)
+                        .unwrap_or_else(|| {
+                            fail_in(
+                                owner.key,
+                                format!("`{key}` has no member `{name}` in the constant"),
+                            )
+                        })
+                };
+
+                let fields = match layouts.get(&target.mangled) {
+                    Some(layout) => pod_slots(layout)
+                        .into_iter()
+                        .map(|slot| match slot {
+                            PodSlot::Padding { index, bytes } => {
+                                let field = quote::format_ident!("_padding{index}");
+                                quote::quote!(#field: [0u8; #bytes])
+                            }
+                            PodSlot::Member(index) => {
+                                let name = &layout.members[index].name;
+                                let field = rust_ident(name);
+                                let value = self.render_value(
+                                    owner,
+                                    value_of(name),
+                                    exports,
+                                    layouts,
+                                    true,
+                                );
+                                quote::quote!(#field: #value)
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                    None => members
+                        .iter()
+                        .map(|(name, value)| {
+                            let field = rust_ident(name);
+                            let value = self.render_value(owner, value, exports, layouts, false);
+                            quote::quote!(#field: #value)
+                        })
+                        .collect(),
+                };
+
+                quote::quote!(#path { #(#fields),* })
+            }
+        }
     }
 
     /// Reads the layout of an exported struct out of a compiled shader.
@@ -1107,11 +1432,11 @@ impl<'a> Context<'a> {
         })
     }
 
-    /// Converts a field type of the exported struct `export` into Rust code.
-    /// `pod` is whether the struct is blittable.
+    /// Converts a type that is used by `owner` into Rust code. `pod` is whether
+    /// the type is a field of a blittable struct.
     fn render_type(
         &self,
-        export: &ExportedStruct,
+        owner: &Owner,
         ty: &Ty,
         exports: &[ExportedStruct],
         pod: bool,
@@ -1147,12 +1472,12 @@ impl<'a> Context<'a> {
                 quote::quote!([[#prim; #rows]; #columns])
             }
             Ty::Array(element, length) => {
-                let element = self.render_type(export, element, exports, pod);
+                let element = self.render_type(owner, element, exports, pod);
                 let length = *length as usize;
                 quote::quote!([#element; #length])
             }
             Ty::RuntimeArray(element) => {
-                let element = self.render_type(export, element, exports, pod);
+                let element = self.render_type(owner, element, exports, pod);
                 quote::quote!([#element])
             }
             Ty::Named(key) => {
@@ -1160,32 +1485,7 @@ impl<'a> Context<'a> {
                     return quote::quote!(#replacement);
                 }
 
-                let Some(target) = exports.iter().find(|export| &export.key == key) else {
-                    fail_in(
-                        &export.key,
-                        format!(
-                            "`{key}` is not exported; mark it `@export`, or add an entry for it to the `external_types` option"
-                        ),
-                    );
-                };
-
-                // The shortest path to `target` from the current module.
-                let module = &export.module.components;
-                let target_module = &target.module.components;
-                let shared = module
-                    .iter()
-                    .zip(target_module)
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                let mut path = vec![if shared == module.len() {
-                    quote::format_ident!("self")
-                } else {
-                    quote::format_ident!("super")
-                }];
-                path.extend((shared + 1..module.len()).map(|_| quote::format_ident!("super")));
-                path.extend(target_module[shared..].iter().map(|c| rust_ident(c)));
-                path.push(rust_ident(&target.name));
-                quote::quote!(#(#path)::*)
+                struct_path(owner, find_export(owner, exports, key))
             }
         }
     }
@@ -1198,32 +1498,30 @@ impl<'a> Context<'a> {
         layout: Option<&PodLayout>,
     ) -> proc_macro2::TokenStream {
         let name = rust_ident(&export.name);
+        let owner = export.owner();
         let docs = export.docs.iter().map(|line| quote::quote!(#[doc = #line]));
 
         if let Some(layout) = layout {
             let mut fields = Vec::new();
             let mut assertions = Vec::new();
-            let mut cursor = 0u32;
-            let mut padding = 0;
 
-            let mut push_padding = |fields: &mut Vec<proc_macro2::TokenStream>, bytes: u32| {
-                if bytes > 0 {
-                    let field = quote::format_ident!("_padding{padding}");
-                    let bytes = bytes as usize;
-                    fields.push(quote::quote! {
-                        #[doc = "Explicit padding, so that the struct matches the shader's layout."]
-                        pub #field: [u8; #bytes]
-                    });
-                    padding += 1;
-                }
-            };
+            for slot in pod_slots(layout) {
+                let index = match slot {
+                    PodSlot::Padding { index, bytes } => {
+                        let field = quote::format_ident!("_padding{index}");
+                        fields.push(quote::quote! {
+                            #[doc = "Explicit padding, so that the struct matches the shader's layout."]
+                            pub #field: [u8; #bytes]
+                        });
+                        continue;
+                    }
+                    PodSlot::Member(index) => index,
+                };
 
-            for (member, source) in layout.members.iter().zip(&export.members) {
-                push_padding(&mut fields, member.offset - cursor);
-                cursor = member.offset + member.size;
-
+                let member = &layout.members[index];
+                let source = &export.members[index];
                 let field = rust_ident(&member.name);
-                let ty = self.render_type(export, &member.ty, exports, true);
+                let ty = self.render_type(&owner, &member.ty, exports, true);
                 let docs = source.docs.iter().map(|line| quote::quote!(#[doc = #line]));
                 fields.push(quote::quote! {
                     #(#docs)*
@@ -1240,7 +1538,7 @@ impl<'a> Context<'a> {
                     // `offset_of!` cannot be used on a slice. The padding before
                     // it is explicit, so Rust only has to not add any more.
                     Ty::RuntimeArray(element) => {
-                        let element = self.render_type(export, element, exports, true);
+                        let element = self.render_type(&owner, element, exports, true);
                         quote::quote! {
                             ::core::assert!(#offset % ::core::mem::align_of::<#element>() == 0, #message);
                             ::core::assert!(::core::mem::size_of::<#element>() == #size, #message);
@@ -1257,8 +1555,6 @@ impl<'a> Context<'a> {
             // so it cannot be `Pod` or `Copy`, and has no size to check.
             let sized = !layout.is_unsized();
             let (derives, bytemuck, default) = if sized {
-                push_padding(&mut fields, layout.size - cursor);
-
                 let size = layout.size as usize;
                 let message = format!(
                     "`{}` does not have the same size as the WESL struct",
@@ -1314,7 +1610,7 @@ impl<'a> Context<'a> {
             let mut last = None;
             for member in &export.members {
                 let ty = self.tree_type(&export.key, &member.ty);
-                let rendered = self.render_type(export, &ty, exports, false);
+                let rendered = self.render_type(&owner, &ty, exports, false);
                 last = Some(ty);
                 let field = rust_ident(&member.name);
                 let docs = member.docs.iter().map(|line| quote::quote!(#[doc = #line]));
@@ -1347,6 +1643,117 @@ impl<'a> Context<'a> {
     }
 }
 
+/// One field of a blittable struct in Rust.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PodSlot {
+    /// Explicit padding of this many bytes. Padding fields are numbered in the
+    /// order they appear.
+    Padding {
+        /// The number in the name of the field.
+        index: usize,
+        /// The size of the field, in bytes.
+        bytes: usize,
+    },
+    /// The member of the layout at this index.
+    Member(usize),
+}
+
+/// Lists the fields of the Rust struct for `layout`, in order. The members of
+/// the layout are separated by the padding that gives them their offsets, and
+/// a sized struct is padded to its full size at the end.
+fn pod_slots(layout: &PodLayout) -> Vec<PodSlot> {
+    let mut slots = Vec::new();
+    let mut cursor = 0u32;
+    let mut padding = 0;
+
+    let mut pad = |slots: &mut Vec<PodSlot>, bytes: u32| {
+        if bytes > 0 {
+            slots.push(PodSlot::Padding {
+                index: padding,
+                bytes: bytes as usize,
+            });
+            padding += 1;
+        }
+    };
+
+    for (index, member) in layout.members.iter().enumerate() {
+        pad(&mut slots, member.offset - cursor);
+        slots.push(PodSlot::Member(index));
+        cursor = member.offset + member.size;
+    }
+
+    if !layout.is_unsized() {
+        pad(&mut slots, layout.size - cursor);
+    }
+
+    slots
+}
+
+/// The item that a type is being generated for, which is used for paths
+/// and error messages.
+struct Owner<'a> {
+    /// The module that the item is declared in.
+    module: &'a ModulePath,
+    /// The path of the item from the package root.
+    key: &'a str,
+}
+
+impl ExportedStruct {
+    /// The details of this struct that are needed to render types.
+    fn owner(&self) -> Owner<'_> {
+        Owner {
+            module: &self.module,
+            key: &self.key,
+        }
+    }
+}
+
+impl ExportedConst {
+    /// The details of this constant that are needed to render types.
+    fn owner(&self) -> Owner<'_> {
+        Owner {
+            module: &self.module,
+            key: &self.key,
+        }
+    }
+}
+
+/// Finds the exported struct with the path `key`, which `owner` refers to.
+/// Stops compilation if there is none.
+fn find_export<'a>(owner: &Owner, exports: &'a [ExportedStruct], key: &str) -> &'a ExportedStruct {
+    exports
+        .iter()
+        .find(|export| export.key == key)
+        .unwrap_or_else(|| {
+            fail_in(
+                owner.key,
+                format!(
+                    "`{key}` is not exported; mark it `@export`, or add an entry for it to the `external_types` option"
+                ),
+            )
+        })
+}
+
+/// The shortest Rust path to `target` from the module of `owner`.
+fn struct_path(owner: &Owner, target: &ExportedStruct) -> proc_macro2::TokenStream {
+    let module = &owner.module.components;
+    let target_module = &target.module.components;
+    let shared = module
+        .iter()
+        .zip(target_module)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut path = vec![if shared == module.len() {
+        quote::format_ident!("self")
+    } else {
+        quote::format_ident!("super")
+    }];
+    path.extend((shared + 1..module.len()).map(|_| quote::format_ident!("super")));
+    path.extend(target_module[shared..].iter().map(|c| rust_ident(c)));
+    path.push(rust_ident(&target.name));
+    quote::quote!(#(#path)::*)
+}
+
 /// Finds the struct called `mangled` in a compiled shader. Returns `None` if
 /// this variant of the shader does not define it.
 fn find_struct(module: &Module, mangled: &str) -> Option<Handle<Type>> {
@@ -1369,16 +1776,21 @@ fn find_constant(module: &Module, mangled: &str) -> Option<Handle<Constant>> {
         .map(|(handle, _)| handle)
 }
 
-/// Gets the value of the constant expression `expression`, which Naga has
-/// already evaluated. Returns `None` if the value is not a scalar.
-fn const_value(module: &Module, expression: Handle<naga::Expression>) -> Option<Lit> {
-    match module.global_expressions[expression] {
-        naga::Expression::Literal(literal) => Lit::from_naga(literal),
-        naga::Expression::Constant(constant) => {
-            const_value(module, module.constants[constant].init)
+/// Flattens scalars and vectors into a single list of scalars, in order.
+fn scalars(values: Vec<Value>) -> std::result::Result<Vec<Lit>, String> {
+    let mut result = Vec::new();
+    for value in values {
+        match value {
+            Value::Scalar(lit) => result.push(lit),
+            Value::Vector(lits) => result.extend(lits),
+            _ => {
+                return Err(
+                    "a vector or matrix was built from something other than scalars".into(),
+                );
+            }
         }
-        _ => None,
     }
+    Ok(result)
 }
 
 /// Stops compilation with an error about the exported item `owner`.
