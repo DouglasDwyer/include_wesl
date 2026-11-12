@@ -198,3 +198,30 @@ fn plain_structs_can_end_in_slices() {
     }
     let _ = takes_labels;
 }
+
+/// Constants in the root module are at the top level, and keep their types.
+#[test]
+fn root_consts_are_at_top_level() {
+    assert_eq!(HEADER_MAGIC, 0x4d41_4749);
+    assert_eq!(&HEADER_MAGIC.to_le_bytes(), b"IGAM");
+}
+
+/// Constants are in modules that match the WESL ones, and their initializers
+/// have been evaluated.
+#[test]
+fn consts_are_evaluated_in_modules() {
+    use scene::model::{BRICK_VOLUME, COMPRESSED, MIN_SCALE};
+
+    assert_eq!(BRICK_VOLUME, 64);
+    assert_eq!(MIN_SCALE, 0.25);
+    const { assert!(!COMPRESSED) };
+}
+
+/// Exported constants can be used wherever Rust needs a constant expression.
+#[test]
+fn consts_are_usable_in_const_contexts() {
+    use scene::model::BRICK_VOLUME;
+
+    const WORDS: [u32; BRICK_VOLUME as usize] = [0; BRICK_VOLUME as usize];
+    assert_eq!(WORDS.len(), 64);
+}

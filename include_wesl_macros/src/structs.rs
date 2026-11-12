@@ -1,10 +1,10 @@
 // NOTE: This is a slop-coded experimental module and subject to change.
 
-// Generation of Rust struct definitions from the structs that a WESL package
-// marks with `@export`.
+// Generation of Rust definitions from the structs and constants that a WESL
+// package marks with `@export`.
 //
-// Every `@export` struct in a module that WESL loads is exported. WESL only
-// loads a module when something refers to one of its items, so a struct in a
+// Every `@export` item in a module that WESL loads is exported. WESL only
+// loads a module when something refers to one of its items, so an item in a
 // module that nothing uses is not found.
 //
 // A struct is generated one of two ways:
@@ -26,6 +26,14 @@
 // (`array<T>`) becomes a dynamically-sized Rust struct whose last field is a
 // slice (`[T]`). Such structs cannot be `Copy` or `Pod`, but a blittable one
 // still has its field offsets and sizes checked against the shader.
+//
+// A `const` marked `@export` becomes a Rust `const` with the same value. Naga
+// has already evaluated the initializer by the time it reaches this module, so
+// the value is emitted whole, not as an expression that refers to other
+// constants. The value has to be the same in every feature variant of the
+// shader where the constant exists. Naga drops constants of an abstract type
+// (like `const A = 1;`) since they only exist at their uses, so the type has
+// to be written out (`const A: u32 = 1;`).
 
 use super::*;
 use syn::parse::*;
@@ -276,6 +284,101 @@ struct ExportedStruct {
     members: Vec<ExportedMember>,
 }
 
+/// A `const` that is marked `@export`.
+struct ExportedConst {
+    /// The module that the constant is declared in.
+    module: ModulePath,
+    /// The unmangled name of the constant.
+    name: String,
+    /// The name of the constant in the compiled shader.
+    mangled: String,
+    /// The path of the constant from the package root.
+    key: String,
+    /// The doc comments on the constant.
+    docs: Vec<String>,
+}
+
+/// Everything in a package that is marked `@export`.
+struct Exports {
+    /// The exported structs, sorted by path.
+    structs: Vec<ExportedStruct>,
+    /// The exported constants, sorted by path.
+    consts: Vec<ExportedConst>,
+}
+
+/// A scalar value, as it appears in a constant. Floats are stored as their bits
+/// so that values can be compared exactly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Lit {
+    /// A `bool`.
+    Bool(bool),
+    /// An `f16`, widened to the bits of an `f32`.
+    F16(u32),
+    /// The bits of an `f32`.
+    F32(u32),
+    /// The bits of an `f64`.
+    F64(u64),
+    /// An `i32`.
+    I32(i32),
+    /// An `i64`.
+    I64(i64),
+    /// A `u32`.
+    U32(u32),
+    /// A `u64`.
+    U64(u64),
+}
+
+impl Lit {
+    /// Converts from a Naga literal. Returns `None` for abstract and 16-bit
+    /// integer literals, which constants do not have in a validated shader.
+    fn from_naga(literal: naga::Literal) -> Option<Self> {
+        Some(match literal {
+            naga::Literal::Bool(value) => Self::Bool(value),
+            naga::Literal::F16(value) => Self::F16(value.to_f32().to_bits()),
+            naga::Literal::F32(value) => Self::F32(value.to_bits()),
+            naga::Literal::F64(value) => Self::F64(value.to_bits()),
+            naga::Literal::I32(value) => Self::I32(value),
+            naga::Literal::I64(value) => Self::I64(value),
+            naga::Literal::U32(value) => Self::U32(value),
+            naga::Literal::U64(value) => Self::U64(value),
+            _ => return None,
+        })
+    }
+
+    /// The type of the literal.
+    fn prim(self) -> Prim {
+        match self {
+            Self::Bool(_) => Prim::Bool,
+            Self::F16(_) => Prim::F16,
+            Self::F32(_) => Prim::F32,
+            Self::F64(_) => Prim::F64,
+            Self::I32(_) => Prim::I32,
+            Self::I64(_) => Prim::I64,
+            Self::U32(_) => Prim::U32,
+            Self::U64(_) => Prim::U64,
+        }
+    }
+
+    /// The Rust expression for the literal.
+    fn tokens(self) -> proc_macro2::TokenStream {
+        use proc_macro2::Literal as Token;
+
+        let token = |literal: Token| quote::quote!(#literal);
+        match self {
+            Self::Bool(value) => quote::quote!(#value),
+            // The type is known from where the literal is used, since `f16`
+            // literals cannot be written on stable Rust.
+            Self::F16(bits) => token(Token::f32_unsuffixed(f32::from_bits(bits))),
+            Self::F32(bits) => token(Token::f32_suffixed(f32::from_bits(bits))),
+            Self::F64(bits) => token(Token::f64_suffixed(f64::from_bits(bits))),
+            Self::I32(value) => token(Token::i32_suffixed(value)),
+            Self::I64(value) => token(Token::i64_suffixed(value)),
+            Self::U32(value) => token(Token::u32_suffixed(value)),
+            Self::U64(value) => token(Token::u64_suffixed(value)),
+        }
+    }
+}
+
 /// A member of an [`ExportedStruct`].
 struct ExportedMember {
     /// The name of the field.
@@ -346,23 +449,46 @@ pub fn generate(shader_path: &Path, options: &Options) -> (proc_macro2::TokenStr
     let context = Context::new(&compilation, options);
     let exports = context.collect_exports();
 
-    let layouts = if exports.is_empty() {
-        HashMap::new()
+    // Every variant of the shader is needed to check that the exported items
+    // agree between them.
+    let modules = if exports.structs.is_empty() && exports.consts.is_empty() {
+        Vec::new()
     } else {
-        context.blittable_layouts(shader_path, &exports)
+        compile_variants(shader_path, &collect_features(&compilation))
     };
+    let layouts = context.blittable_layouts(&modules, &exports.structs);
+    let values = context.const_values(&modules, &exports.consts);
 
     let mut root = ModuleNode::default();
-    for export in &exports {
+    for export in &exports.structs {
         let layout = layouts.get(&export.mangled);
         let tokens = match options.external_types.get(&export.key) {
             Some(replacement) => render_replacement(export, replacement, layout),
-            None => context.render_struct(export, &exports, layout),
+            None => context.render_struct(export, &exports.structs, layout),
         };
         root.insert(&export.module.components, tokens);
     }
+    for export in &exports.consts {
+        if let Some(value) = values.get(&export.mangled) {
+            root.insert(&export.module.components, render_const(export, *value));
+        }
+    }
 
     (root.render(&[]), files)
+}
+
+/// Writes the definition of an exported constant.
+fn render_const(export: &ExportedConst, value: Lit) -> proc_macro2::TokenStream {
+    let name = rust_ident(&export.name);
+    let docs = export.docs.iter().map(|line| quote::quote!(#[doc = #line]));
+    let ty = value.prim().tokens();
+    let value = value.tokens();
+
+    quote::quote! {
+        #(#docs)*
+        #[allow(non_upper_case_globals, missing_docs, dead_code, clippy::missing_docs_in_private_items)]
+        pub const #name: #ty = #value;
+    }
 }
 
 /// Writes the checks for an exported struct that the caller replaced with a
@@ -522,57 +648,70 @@ impl<'a> Context<'a> {
             .unwrap_or("")
     }
 
-    /// Finds every struct marked `@export`, and checks that the attribute is
-    /// only used on structs. WESL only loads modules that something refers to,
-    /// so a struct in a module that nothing uses is not found.
-    fn collect_exports(&self) -> Vec<ExportedStruct> {
-        let mut result = Vec::new();
+    /// Finds every struct and `const` marked `@export`, and checks that the
+    /// attribute is not used on anything else. WESL only loads modules that
+    /// something refers to, so an item in a module that nothing uses is not
+    /// found.
+    fn collect_exports(&self) -> Exports {
+        let mut structs = Vec::new();
+        let mut consts = Vec::new();
 
         for module in self.compilation.modules() {
             let source = self.source(&module.path);
 
             for declaration in &module.syntax.global_declarations {
-                if let GlobalDeclaration::Struct(item) = &**declaration {
-                    if has_export_attribute(&item.attributes) {
-                        result.push(self.export_struct(
-                            &module.path,
-                            source,
-                            declaration.span().range().start,
-                            item,
-                        ));
+                let start = declaration.span().range().start;
+                let (attributes, kind) = match &**declaration {
+                    GlobalDeclaration::Struct(item) => {
+                        if has_export_attribute(&item.attributes) {
+                            structs.push(self.export_struct(&module.path, source, start, item));
+                        }
+                        continue;
                     }
-                } else {
-                    let (attributes, kind) = match &**declaration {
-                        GlobalDeclaration::Declaration(item) => (&item.attributes, "declaration"),
-                        GlobalDeclaration::TypeAlias(item) => (&item.attributes, "type alias"),
-                        GlobalDeclaration::Function(item) => (&item.attributes, "function"),
-                        _ => continue,
-                    };
+                    GlobalDeclaration::Declaration(item) if item.kind == DeclarationKind::Const => {
+                        if has_export_attribute(&item.attributes) {
+                            consts.push(self.export_const(&module.path, source, start, item));
+                        }
+                        continue;
+                    }
+                    GlobalDeclaration::Declaration(item) => (
+                        &item.attributes,
+                        match item.kind {
+                            DeclarationKind::Override => "override declaration",
+                            DeclarationKind::Let => "let declaration",
+                            _ => "variable",
+                        },
+                    ),
+                    GlobalDeclaration::TypeAlias(item) => (&item.attributes, "type alias"),
+                    GlobalDeclaration::Function(item) => (&item.attributes, "function"),
+                    _ => continue,
+                };
 
-                    if has_export_attribute(attributes) {
-                        fail(format!(
-                            "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs, but it is on a {kind} in module `{}`",
-                            module_display(&module.path)
-                        ));
-                    }
+                if has_export_attribute(attributes) {
+                    fail(format!(
+                        "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs and constants, but it is on a {kind} in module `{}`",
+                        module_display(&module.path)
+                    ));
                 }
             }
         }
 
         // Anything left over is on a struct member, function parameter, etc.
+        let found = structs.len() + consts.len();
         let total = wesl::pass::Visit::<Attributes>::visit(self.compilation.syntax())
             .flatten()
             .filter(|attribute| is_export(attribute))
             .count();
-        if total != result.len() {
+        if total != found {
             fail(format!(
-                "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs (found {} on something else)",
-                total.saturating_sub(result.len())
+                "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs and constants (found {} on something else)",
+                total.saturating_sub(found)
             ));
         }
 
-        result.sort_by(|a, b| a.key.cmp(&b.key));
-        result
+        structs.sort_by(|a, b| a.key.cmp(&b.key));
+        consts.sort_by(|a, b| a.key.cmp(&b.key));
+        Exports { structs, consts }
     }
 
     /// Gets the name that `ident` had before mangling.
@@ -628,6 +767,34 @@ impl<'a> Context<'a> {
             key,
             docs: doc_comments(source, start),
             members,
+        }
+    }
+
+    /// Collects the information about one exported constant.
+    fn export_const(
+        &self,
+        module: &ModulePath,
+        source: &str,
+        start: usize,
+        item: &Declaration,
+    ) -> ExportedConst {
+        let mangled = item.ident.name().to_string();
+        let name = self.original_name(&mangled);
+        let key = item_key(module, &name);
+
+        if item.attributes.iter().any(is_conditional) {
+            fail_in(
+                &key,
+                "conditional translation on exported constants is not supported",
+            );
+        }
+
+        ExportedConst {
+            module: module.clone(),
+            name,
+            mangled,
+            key,
+            docs: doc_comments(source, start),
         }
     }
 
@@ -774,31 +941,26 @@ impl<'a> Context<'a> {
     /// The result is keyed by the name of the struct in the compiled shader.
     fn blittable_layouts(
         &self,
-        shader_path: &Path,
+        modules: &[Module],
         exports: &[ExportedStruct],
     ) -> HashMap<String, PodLayout> {
-        let features = collect_features(self.compilation);
         let mut result: HashMap<String, PodLayout> = HashMap::new();
         let mut disqualified = HashSet::new();
         let mut defined = HashSet::new();
 
-        for mask in 0..(1u32 << features.len()) {
-            let module = compile_naga(&compile_variant(
-                shader_path,
-                variant_flags(mask, &features),
-            ));
+        for module in modules {
             let mut layouter = naga::proc::Layouter::default();
             if let Err(e) = layouter.update(module.to_ctx()) {
                 fail(format!("error: failed to compute layouts: {e}"));
             }
 
             for export in exports {
-                let Some(handle) = find_struct(&module, &export.mangled) else {
+                let Some(handle) = find_struct(module, &export.mangled) else {
                     continue;
                 };
                 defined.insert(export.mangled.as_str());
 
-                match self.struct_layout(&module, &layouter, handle) {
+                match self.struct_layout(module, &layouter, handle) {
                     Some(layout) => match result.get(&export.mangled) {
                         None => {
                             result.insert(export.mangled.clone(), layout);
@@ -849,6 +1011,53 @@ impl<'a> Context<'a> {
             if result.len() == before {
                 break;
             }
+        }
+
+        result
+    }
+
+    /// Finds the value of every exported constant. A constant does not have to
+    /// be defined in every variant of the shader, but it must have the same
+    /// value in the ones that define it. It must be defined in at least one.
+    ///
+    /// The result is keyed by the name of the constant in the compiled shader.
+    fn const_values(&self, modules: &[Module], exports: &[ExportedConst]) -> HashMap<String, Lit> {
+        let mut result = HashMap::<String, Lit>::new();
+
+        for module in modules {
+            for export in exports {
+                let Some(handle) = find_constant(module, &export.mangled) else {
+                    continue;
+                };
+
+                let Some(value) = const_value(module, module.constants[handle].init) else {
+                    fail_in(
+                        &export.key,
+                        "only constants of a scalar type (`bool`, `i32`, `u32`, `f32`, `f16`, `i64`, `u64` or `f64`) can be exported",
+                    );
+                };
+
+                match result.get(&export.mangled) {
+                    None => {
+                        result.insert(export.mangled.clone(), value);
+                    }
+                    Some(first) if *first != value => fail_in(
+                        &export.key,
+                        "the constant has a different value or type in different variants of the shader, so it has no single Rust value",
+                    ),
+                    Some(_) => {}
+                }
+            }
+        }
+
+        if let Some(export) = exports
+            .iter()
+            .find(|export| !result.contains_key(&export.mangled))
+        {
+            fail_in(
+                &export.key,
+                "the constant was not found in any variant of the compiled shader; constants of an abstract type, like `const A = 1;`, are not kept by the compiler, so give it a type (`const A: u32 = 1;`)",
+            );
         }
 
         result
@@ -1150,9 +1359,31 @@ fn find_struct(module: &Module, mangled: &str) -> Option<Handle<Type>> {
         .map(|(handle, _)| handle)
 }
 
-/// Stops compilation with an error about the exported struct `owner`.
+/// Finds the constant called `mangled` in a compiled shader. Returns `None` if
+/// this variant of the shader does not define it.
+fn find_constant(module: &Module, mangled: &str) -> Option<Handle<Constant>> {
+    module
+        .constants
+        .iter()
+        .find(|(_, constant)| constant.name.as_deref() == Some(mangled))
+        .map(|(handle, _)| handle)
+}
+
+/// Gets the value of the constant expression `expression`, which Naga has
+/// already evaluated. Returns `None` if the value is not a scalar.
+fn const_value(module: &Module, expression: Handle<naga::Expression>) -> Option<Lit> {
+    match module.global_expressions[expression] {
+        naga::Expression::Literal(literal) => Lit::from_naga(literal),
+        naga::Expression::Constant(constant) => {
+            const_value(module, module.constants[constant].init)
+        }
+        _ => None,
+    }
+}
+
+/// Stops compilation with an error about the exported item `owner`.
 fn fail_in(owner: &str, message: impl std::fmt::Display) -> ! {
-    fail(format!("error in exported struct `{owner}`: {message}"))
+    fail(format!("error in exported item `{owner}`: {message}"))
 }
 
 /// Gets the name of the `glam` type that matches a WGSL matrix, if there is
@@ -1371,14 +1602,18 @@ mod tests {
 
     /// The attribute only makes sense on structs.
     #[test]
-    #[should_panic(expected = "can only be applied to structs, but it is on a function")]
+    #[should_panic(
+        expected = "can only be applied to structs and constants, but it is on a function"
+    )]
     fn test_export_rejects_functions() {
         generate_package("function", &[("package.wesl", "@export fn f() {}")], &[]);
     }
 
     /// Members cannot be exported either.
     #[test]
-    #[should_panic(expected = "can only be applied to structs (found 1 on something else)")]
+    #[should_panic(
+        expected = "can only be applied to structs and constants (found 1 on something else)"
+    )]
     fn test_export_rejects_members() {
         generate_package(
             "member",
@@ -1757,6 +1992,216 @@ mod tests {
             "atomic_float",
             &[("package.wesl", "@export struct A { x: atomic<bool> }")],
             &[],
+        );
+    }
+
+    /// Scalar constants become Rust constants of the same type and value.
+    #[test]
+    fn test_scalar_consts() {
+        let source = "
+            enable f16;
+            @export const A: u32 = 7u;
+            @export const B: i32 = -3i;
+            @export const C: f32 = 0.5f;
+            @export const D: bool = true;
+            @export const E: f16 = 1.5h;
+            @export const F: u64 = 5lu;
+            @export const G: i64 = -5li;
+            @export const H: f64 = 2.25lf;
+        ";
+        let output = generate_package("scalar_consts", &[("package.wesl", source)], &[]);
+        for expected in [
+            "pub const A : u32 = 7u32 ;",
+            "pub const B : i32 = - 3i32 ;",
+            "pub const C : f32 = 0.5f32 ;",
+            "pub const D : bool = true ;",
+            "pub const E : f16 = 1.5 ;",
+            "pub const F : u64 = 5u64 ;",
+            "pub const G : i64 = - 5i64 ;",
+            "pub const H : f64 = 2.25f64 ;",
+        ] {
+            assert!(
+                output.contains(expected),
+                "{expected} missing from {output}"
+            );
+        }
+    }
+
+    /// The initializer is evaluated, including references to other constants.
+    #[test]
+    fn test_consts_are_evaluated() {
+        let source = "
+            const SIZE: u32 = 4u;
+            @export const VOLUME: u32 = SIZE * SIZE * SIZE + 1u;
+            @export const RATIO: f32 = f32(SIZE) / 8.0;
+        ";
+        let output = generate_package("evaluated_consts", &[("package.wesl", source)], &[]);
+        assert!(
+            output.contains("pub const VOLUME : u32 = 65u32 ;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub const RATIO : f32 = 0.5f32 ;"),
+            "{output}"
+        );
+        assert!(!output.contains("SIZE"), "{output}");
+    }
+
+    /// Constants that are not marked `@export` are not generated.
+    #[test]
+    fn test_unmarked_consts_are_not_exported() {
+        let source = "const A: u32 = 1u;\npublic const B: u32 = 2u;\n@export const C: u32 = 3u;";
+        let output = generate_package("unmarked_consts", &[("package.wesl", source)], &[]);
+        assert!(!output.contains("const A"), "{output}");
+        assert!(!output.contains("const B"), "{output}");
+        assert!(output.contains("const C"), "{output}");
+    }
+
+    /// Doc comments are carried over to constants, which live in the module
+    /// that declares them.
+    #[test]
+    fn test_const_docs_and_modules() {
+        let output = generate_package(
+            "const_docs",
+            &[
+                (
+                    "package.wesl",
+                    "import package::inner;\n/// The root.\n@export const A: u32 = 1u;\nfn f() -> u32 { return inner::B; }",
+                ),
+                ("inner.wesl", "/// Inner.\n@export const B: u32 = 2u;"),
+            ],
+            &[],
+        );
+        assert!(output.contains("# [doc = \"The root.\"]"), "{output}");
+        let (root, inner) = output
+            .split_once("pub mod inner")
+            .expect("module generated");
+        assert!(root.contains("const A"), "{output}");
+        assert!(inner.contains("# [doc = \"Inner.\"]"), "{output}");
+        assert!(inner.contains("pub const B : u32 = 2u32 ;"), "{output}");
+    }
+
+    /// Constants can share a name with a struct in another module, and
+    /// constants may be exported next to structs.
+    #[test]
+    fn test_consts_and_structs_together() {
+        let source = "@export struct A { x: u32 }\n@export const SIZE: u32 = 4u;";
+        let output = generate_package("consts_and_structs", &[("package.wesl", source)], &[]);
+        assert!(output.contains("pub struct A"), "{output}");
+        assert!(output.contains("pub const SIZE : u32 = 4u32 ;"), "{output}");
+    }
+
+    /// Overrides are only known when the pipeline is created, and variables
+    /// have no value at compile time.
+    #[test]
+    #[should_panic(expected = "but it is on a override declaration")]
+    fn test_export_rejects_overrides() {
+        generate_package(
+            "override",
+            &[("package.wesl", "@export override x: u32 = 1u;")],
+            &[],
+        );
+    }
+
+    /// Variables cannot be exported.
+    #[test]
+    #[should_panic(expected = "but it is on a variable")]
+    fn test_export_rejects_variables() {
+        generate_package(
+            "variable",
+            &[("package.wesl", "@export var<private> x: u32 = 1u;")],
+            &[],
+        );
+    }
+
+    /// Naga does not keep constants of an abstract type, so they are an error
+    /// instead of being silently dropped.
+    #[test]
+    #[should_panic(expected = "give it a type")]
+    fn test_abstract_consts_need_a_type() {
+        generate_package("abstract", &[("package.wesl", "@export const A = 1;")], &[]);
+    }
+
+    /// Constants that are not scalars are not supported yet.
+    #[test]
+    #[should_panic(expected = "can be exported")]
+    fn test_non_scalar_consts_are_rejected() {
+        generate_package(
+            "non_scalar",
+            &[("package.wesl", "@export const A: vec2u = vec2u(1u, 2u);")],
+            &[],
+        );
+    }
+
+    /// A constant has to have a single value in Rust.
+    #[test]
+    #[should_panic(expected = "different value or type in different variants")]
+    fn test_variant_dependent_consts_are_rejected() {
+        let source = "
+            @if(wide) const N: u32 = 1u;
+            @if(!wide) const N: u32 = 2u;
+            @export const K: u32 = N;
+        ";
+        generate_package("variant_const", &[("package.wesl", source)], &[]);
+    }
+
+    /// A constant whose type changes is also variant-dependent.
+    #[test]
+    #[should_panic(expected = "different value or type in different variants")]
+    fn test_variant_dependent_const_types_are_rejected() {
+        let source = "
+            @if(half) enable f16;
+            @if(half) alias m16 = f16;
+            @if(!half) alias m16 = f32;
+            @export const K: m16 = 1.0;
+        ";
+        generate_package("variant_const_type", &[("package.wesl", source)], &[]);
+    }
+
+    /// Conditional translation cannot be applied to the constant itself.
+    #[test]
+    #[should_panic(expected = "conditional translation on exported constants is not supported")]
+    fn test_conditional_consts_are_rejected() {
+        generate_package(
+            "conditional_const",
+            &[("package.wesl", "@if(a) @export const A: u32 = 1u;")],
+            &[],
+        );
+    }
+
+    /// A constant in a module that is only imported in some variants is
+    /// generated once.
+    #[test]
+    fn test_consts_missing_from_some_variants_are_exported() {
+        let output = generate_package(
+            "conditional_module_const",
+            &[
+                ("package.wesl", CONDITIONAL_MODULE_SOURCE),
+                (
+                    "sw.wesl",
+                    "@export struct B { x: u32 }\n@export const K: u32 = 4u;",
+                ),
+            ],
+            &[],
+        );
+        assert_eq!(
+            output.matches("pub const K : u32 = 4u32 ;").count(),
+            1,
+            "{output}"
+        );
+    }
+
+    /// The constants in the fixture are in the modules that declare them.
+    #[test]
+    fn test_fixture_consts() {
+        let output = generate_fixture(&fixture_options());
+        assert!(
+            output.contains("pubconstHEADER_MAGIC:u32=1296123721u32;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pubconstBRICK_VOLUME:u32=64u32;"),
+            "{output}"
         );
     }
 
