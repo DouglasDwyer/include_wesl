@@ -1,7 +1,7 @@
 // NOTE: This is a slop-coded experimental module and subject to change.
 
-// Generation of Rust definitions from the structs and constants that a WESL
-// package marks with `@export`.
+// Generation of Rust definitions from the structs, constants and type aliases
+// that a WESL package marks with `@export`.
 //
 // Every `@export` item in a module that WESL loads is exported. WESL only
 // loads a module when something refers to one of its items, so an item in a
@@ -34,6 +34,16 @@
 // shader where the constant exists. Naga drops constants of an abstract type
 // (like `const A = 1;`) since they only exist at their uses, so the type has
 // to be written out (`const A: u32 = 1;`).
+//
+// A type alias marked `@export` becomes a Rust `type` alias for the type that
+// it names. The target is read from the unevaluated syntax tree, as for the
+// fields of plain structs, so it must not depend on the feature variant of the
+// shader (a conditionally-declared alias cannot be exported, unless the caller
+// gives its Rust type). Fields of plain structs that use an exported alias
+// refer to it by name. Blittable structs take their field types from Naga,
+// which no longer knows about aliases, so they spell out the target.
+// Array lengths in the syntax tree may be integer literals, `const`s, or
+// arithmetic on them.
 
 use super::*;
 use syn::parse::*;
@@ -298,12 +308,30 @@ struct ExportedConst {
     docs: Vec<String>,
 }
 
+/// A type alias that is marked `@export`.
+#[derive(Clone)]
+struct ExportedAlias {
+    /// The module that the alias is declared in.
+    module: ModulePath,
+    /// The unmangled name of the alias.
+    name: String,
+    /// The path of the alias from the package root.
+    key: String,
+    /// The doc comments on the alias.
+    docs: Vec<String>,
+    /// The type that the alias names, as it appears in the unevaluated syntax
+    /// tree.
+    ty: TypeExpression,
+}
+
 /// Everything in a package that is marked `@export`.
 struct Exports {
     /// The exported structs, sorted by path.
     structs: Vec<ExportedStruct>,
     /// The exported constants, sorted by path.
     consts: Vec<ExportedConst>,
+    /// The exported type aliases, sorted by path.
+    aliases: Vec<ExportedAlias>,
 }
 
 /// A scalar value, as it appears in a constant. Floats are stored as their bits
@@ -437,6 +465,11 @@ struct Context<'a> {
     unmangled: HashMap<String, ModulePath>,
     /// All type aliases, by their mangled name.
     aliases: HashMap<String, Vec<&'a TypeAlias>>,
+    /// All `const` declarations, by their mangled name.
+    consts: HashMap<String, Vec<&'a Declaration>>,
+    /// The exported type aliases, by their path from the package root. These
+    /// are filled in after the exports have been collected.
+    exported_aliases: HashMap<String, ExportedAlias>,
     /// The caller's options.
     options: &'a Options,
 }
@@ -446,11 +479,17 @@ struct Context<'a> {
 pub fn generate(shader_path: &Path, options: &Options) -> (proc_macro2::TokenStream, Vec<PathBuf>) {
     let compilation = compile_unevaluated(shader_path);
     let files = source_files(&compilation);
-    let context = Context::new(&compilation, options);
+    let mut context = Context::new(&compilation, options);
     let exports = context.collect_exports();
+    context.exported_aliases = exports
+        .aliases
+        .iter()
+        .map(|alias| (alias.key.clone(), alias.clone()))
+        .collect();
 
     // Every variant of the shader is needed to check that the exported items
-    // agree between them.
+    // agree between them. Aliases come from the syntax tree, so they do not
+    // need the variants.
     let modules = if exports.structs.is_empty() && exports.consts.is_empty() {
         Vec::new()
     } else {
@@ -471,6 +510,13 @@ pub fn generate(shader_path: &Path, options: &Options) -> (proc_macro2::TokenStr
     for export in &exports.consts {
         if let Some(value) = values.get(&export.mangled) {
             root.insert(&export.module.components, render_const(export, *value));
+        }
+    }
+    for export in &exports.aliases {
+        // An alias that the caller replaced is only referred to, never defined.
+        if !options.external_types.contains_key(&export.key) {
+            let tokens = context.render_alias(export, &exports.structs);
+            root.insert(&export.module.components, tokens);
         }
     }
 
@@ -580,6 +626,7 @@ impl<'a> Context<'a> {
 
         let mut unmangled = HashMap::new();
         let mut aliases = HashMap::<String, Vec<&TypeAlias>>::new();
+        let mut consts = HashMap::<String, Vec<&Declaration>>::new();
         for module in compilation.modules() {
             for declaration in &module.syntax.global_declarations {
                 if let GlobalDeclaration::Struct(Struct { ident, .. })
@@ -597,6 +644,15 @@ impl<'a> Context<'a> {
                         .or_default()
                         .push(alias);
                 }
+
+                if let GlobalDeclaration::Declaration(item) = &**declaration
+                    && item.kind == DeclarationKind::Const
+                {
+                    consts
+                        .entry(item.ident.name().to_string())
+                        .or_default()
+                        .push(item);
+                }
             }
         }
 
@@ -605,6 +661,8 @@ impl<'a> Context<'a> {
             items,
             unmangled,
             aliases,
+            consts,
+            exported_aliases: HashMap::new(),
             options,
         }
     }
@@ -648,13 +706,14 @@ impl<'a> Context<'a> {
             .unwrap_or("")
     }
 
-    /// Finds every struct and `const` marked `@export`, and checks that the
-    /// attribute is not used on anything else. WESL only loads modules that
-    /// something refers to, so an item in a module that nothing uses is not
-    /// found.
+    /// Finds every struct, `const` and type alias marked `@export`, and checks
+    /// that the attribute is not used on anything else. WESL only loads modules
+    /// that something refers to, so an item in a module that nothing uses is
+    /// not found.
     fn collect_exports(&self) -> Exports {
         let mut structs = Vec::new();
         let mut consts = Vec::new();
+        let mut aliases = Vec::new();
 
         for module in self.compilation.modules() {
             let source = self.source(&module.path);
@@ -682,14 +741,19 @@ impl<'a> Context<'a> {
                             _ => "variable",
                         },
                     ),
-                    GlobalDeclaration::TypeAlias(item) => (&item.attributes, "type alias"),
+                    GlobalDeclaration::TypeAlias(item) => {
+                        if has_export_attribute(&item.attributes) {
+                            aliases.push(self.export_alias(&module.path, source, start, item));
+                        }
+                        continue;
+                    }
                     GlobalDeclaration::Function(item) => (&item.attributes, "function"),
                     _ => continue,
                 };
 
                 if has_export_attribute(attributes) {
                     fail(format!(
-                        "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs and constants, but it is on a {kind} in module `{}`",
+                        "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs, constants and type aliases, but it is on a {kind} in module `{}`",
                         module_display(&module.path)
                     ));
                 }
@@ -697,21 +761,26 @@ impl<'a> Context<'a> {
         }
 
         // Anything left over is on a struct member, function parameter, etc.
-        let found = structs.len() + consts.len();
+        let found = structs.len() + consts.len() + aliases.len();
         let total = wesl::pass::Visit::<Attributes>::visit(self.compilation.syntax())
             .flatten()
             .filter(|attribute| is_export(attribute))
             .count();
         if total != found {
             fail(format!(
-                "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs and constants (found {} on something else)",
+                "error: `@{EXPORT_ATTRIBUTE}` can only be applied to structs, constants and type aliases (found {} on something else)",
                 total.saturating_sub(found)
             ));
         }
 
         structs.sort_by(|a, b| a.key.cmp(&b.key));
         consts.sort_by(|a, b| a.key.cmp(&b.key));
-        Exports { structs, consts }
+        aliases.sort_by(|a, b| a.key.cmp(&b.key));
+        Exports {
+            structs,
+            consts,
+            aliases,
+        }
     }
 
     /// Gets the name that `ident` had before mangling.
@@ -798,14 +867,63 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Collects the information about one exported type alias.
+    fn export_alias(
+        &self,
+        module: &ModulePath,
+        source: &str,
+        start: usize,
+        item: &TypeAlias,
+    ) -> ExportedAlias {
+        let name = self.original_name(&item.ident.name().to_string());
+        let key = item_key(module, &name);
+
+        if item.attributes.iter().any(is_conditional)
+            && !self.options.external_types.contains_key(&key)
+        {
+            fail_in(
+                &key,
+                format!(
+                    "conditional translation on exported type aliases is not supported; add `\"{key}\" => <rust type>` to the `external_types` option instead"
+                ),
+            );
+        }
+
+        ExportedAlias {
+            module: module.clone(),
+            name,
+            key,
+            docs: doc_comments(source, start),
+            ty: item.ty.clone(),
+        }
+    }
+
+    /// Whether `ty`, which comes from the syntax tree, is a runtime-sized array
+    /// once exported aliases are followed.
+    fn is_unsized(&self, ty: &Ty) -> bool {
+        match ty {
+            Ty::RuntimeArray(_) => true,
+            Ty::Named(key) if !self.options.external_types.contains_key(key) => self
+                .exported_aliases
+                .get(key)
+                .is_some_and(|alias| self.is_unsized(&self.tree_type(&alias.key, &alias.ty))),
+            _ => false,
+        }
+    }
+
     /// Determines what Rust type a WESL type expression, which is a field of
-    /// the exported struct `owner`, refers to.
+    /// the exported struct (or the target of the exported alias) `owner`,
+    /// refers to.
     fn tree_type(&self, owner: &str, expression: &TypeExpression) -> Ty {
         let name = expression.ident.name().to_string();
         let name = name.as_str();
 
         if let Some(key) = self.item_key(name) {
-            if self.options.external_types.contains_key(&key) {
+            // Exported aliases are kept by name, so that the generated types
+            // refer to each other the way the shader does.
+            if self.options.external_types.contains_key(&key)
+                || self.exported_aliases.contains_key(&key)
+            {
                 return Ty::Named(key);
             }
 
@@ -870,21 +988,96 @@ impl<'a> Context<'a> {
                 return Ty::RuntimeArray(Box::new(element));
             }
 
-            let length = match args.get(1).map(|arg| &*arg.expression) {
-                Some(wesl::syntax::Expression::Literal(LiteralExpression::AbstractInt(n))) => {
-                    *n as u32
-                }
-                Some(wesl::syntax::Expression::Literal(LiteralExpression::U32(n))) => *n,
-                Some(wesl::syntax::Expression::Literal(LiteralExpression::I32(n))) => *n as u32,
-                _ => fail_in(
-                    owner,
-                    "array lengths in structs that are not blittable must be integer literals",
-                ),
-            };
+            let length = self
+                .tree_integer(&args[1].expression, 0)
+                .and_then(|n| u32::try_from(n).map_err(|_| format!("{n} is not a valid length")))
+                .unwrap_or_else(|reason| {
+                    fail_in(
+                        owner,
+                        format!(
+                            "the array length cannot be determined in a type that is not blittable: {reason}"
+                        ),
+                    )
+                });
             return Ty::Array(Box::new(element), length);
         }
 
         fail_in(owner, format!("the type `{name}` has no Rust equivalent"))
+    }
+
+    /// Evaluates the integer constant expression `expression`, such as the
+    /// length of an array, from the unevaluated syntax tree. Literals, `const`
+    /// declarations, `u32()` and `i32()` conversions, and arithmetic are
+    /// understood. `depth` is how many constants the expression is nested in.
+    /// On failure, returns the reason.
+    fn tree_integer(
+        &self,
+        expression: &wesl::syntax::Expression,
+        depth: u32,
+    ) -> std::result::Result<i64, String> {
+        use wesl::syntax::{BinaryOperator, Expression, UnaryOperator};
+
+        // WGSL does not allow constants to refer to themselves, but the syntax
+        // tree has not been validated.
+        if depth > 32 {
+            return Err("the constants refer to each other in a cycle".into());
+        }
+
+        let integer = |node: &ExpressionNode| self.tree_integer(node, depth);
+        match expression {
+            Expression::Literal(LiteralExpression::AbstractInt(n)) => Ok(*n),
+            Expression::Literal(LiteralExpression::U32(n)) => Ok(i64::from(*n)),
+            Expression::Literal(LiteralExpression::I32(n)) => Ok(i64::from(*n)),
+            Expression::Parenthesized(inner) => integer(&inner.expression),
+            Expression::Unary(unary) if unary.operator == UnaryOperator::Negation => {
+                integer(&unary.operand)?
+                    .checked_neg()
+                    .ok_or_else(|| "the expression overflows".to_string())
+            }
+            Expression::Binary(binary) => {
+                let left = integer(&binary.left)?;
+                let right = integer(&binary.right)?;
+                let result = match binary.operator {
+                    BinaryOperator::Addition => left.checked_add(right),
+                    BinaryOperator::Subtraction => left.checked_sub(right),
+                    BinaryOperator::Multiplication => left.checked_mul(right),
+                    BinaryOperator::Division => left.checked_div(right),
+                    BinaryOperator::Remainder => left.checked_rem(right),
+                    BinaryOperator::ShiftLeft => {
+                        u32::try_from(right).ok().and_then(|n| left.checked_shl(n))
+                    }
+                    BinaryOperator::ShiftRight => {
+                        u32::try_from(right).ok().and_then(|n| left.checked_shr(n))
+                    }
+                    _ => return Err("the expression uses an unsupported operator".into()),
+                };
+                result.ok_or_else(|| "the expression overflows".to_string())
+            }
+            Expression::FunctionCall(call)
+                if matches!(call.ty.ident.name().as_str(), "u32" | "i32")
+                    && call.ty.template_args.is_none()
+                    && call.arguments.len() == 1 =>
+            {
+                integer(&call.arguments[0])
+            }
+            Expression::TypeOrIdentifier(identifier) if identifier.template_args.is_none() => {
+                let name = identifier.ident.name().to_string();
+                match self.consts.get(&name).map(Vec::as_slice) {
+                    Some([item]) if !item.attributes.iter().any(is_conditional) => {
+                        match &item.initializer {
+                            Some(initializer) => self.tree_integer(initializer, depth + 1),
+                            None => Err(format!("`{name}` has no value")),
+                        }
+                    }
+                    Some(_) => Err(format!(
+                        "`{}` is declared conditionally, so it has no single value",
+                        self.original_name(&name)
+                    )),
+                    None => Err(format!("`{}` is not a constant", self.original_name(&name))),
+                }
+            }
+            _ => Err("the expression is not an integer literal or constant".into()),
+        }
     }
 
     /// Determines the Rust type that Naga's `ty` corresponds to. Returns `None`
@@ -1107,11 +1300,11 @@ impl<'a> Context<'a> {
         })
     }
 
-    /// Converts a field type of the exported struct `export` into Rust code.
-    /// `pod` is whether the struct is blittable.
+    /// Converts a type that is used by `owner` into Rust code. `pod` is whether
+    /// the type is a field of a blittable struct.
     fn render_type(
         &self,
-        export: &ExportedStruct,
+        owner: &Owner,
         ty: &Ty,
         exports: &[ExportedStruct],
         pod: bool,
@@ -1147,12 +1340,12 @@ impl<'a> Context<'a> {
                 quote::quote!([[#prim; #rows]; #columns])
             }
             Ty::Array(element, length) => {
-                let element = self.render_type(export, element, exports, pod);
+                let element = self.render_type(owner, element, exports, pod);
                 let length = *length as usize;
                 quote::quote!([#element; #length])
             }
             Ty::RuntimeArray(element) => {
-                let element = self.render_type(export, element, exports, pod);
+                let element = self.render_type(owner, element, exports, pod);
                 quote::quote!([#element])
             }
             Ty::Named(key) => {
@@ -1160,33 +1353,34 @@ impl<'a> Context<'a> {
                     return quote::quote!(#replacement);
                 }
 
-                let Some(target) = exports.iter().find(|export| &export.key == key) else {
-                    fail_in(
-                        &export.key,
-                        format!(
-                            "`{key}` is not exported; mark it `@export`, or add an entry for it to the `external_types` option"
-                        ),
-                    );
-                };
+                if let Some(alias) = self.exported_aliases.get(key) {
+                    return item_path(owner, &alias.module, &alias.name);
+                }
 
-                // The shortest path to `target` from the current module.
-                let module = &export.module.components;
-                let target_module = &target.module.components;
-                let shared = module
-                    .iter()
-                    .zip(target_module)
-                    .take_while(|(a, b)| a == b)
-                    .count();
-                let mut path = vec![if shared == module.len() {
-                    quote::format_ident!("self")
-                } else {
-                    quote::format_ident!("super")
-                }];
-                path.extend((shared + 1..module.len()).map(|_| quote::format_ident!("super")));
-                path.extend(target_module[shared..].iter().map(|c| rust_ident(c)));
-                path.push(rust_ident(&target.name));
-                quote::quote!(#(#path)::*)
+                let target = find_export(owner, exports, key);
+                item_path(owner, &target.module, &target.name)
             }
+        }
+    }
+
+    /// Writes the definition of an exported type alias, as a Rust type alias
+    /// for the type that the WESL alias names. A type alias is not a distinct
+    /// type, so it has the same layout and traits as its target.
+    fn render_alias(
+        &self,
+        export: &ExportedAlias,
+        exports: &[ExportedStruct],
+    ) -> proc_macro2::TokenStream {
+        let name = rust_ident(&export.name);
+        let owner = export.owner();
+        let docs = export.docs.iter().map(|line| quote::quote!(#[doc = #line]));
+        let ty = self.tree_type(&export.key, &export.ty);
+        let rendered = self.render_type(&owner, &ty, exports, false);
+
+        quote::quote! {
+            #(#docs)*
+            #[allow(missing_docs, dead_code, clippy::missing_docs_in_private_items)]
+            pub type #name = #rendered;
         }
     }
 
@@ -1198,6 +1392,7 @@ impl<'a> Context<'a> {
         layout: Option<&PodLayout>,
     ) -> proc_macro2::TokenStream {
         let name = rust_ident(&export.name);
+        let owner = export.owner();
         let docs = export.docs.iter().map(|line| quote::quote!(#[doc = #line]));
 
         if let Some(layout) = layout {
@@ -1223,7 +1418,7 @@ impl<'a> Context<'a> {
                 cursor = member.offset + member.size;
 
                 let field = rust_ident(&member.name);
-                let ty = self.render_type(export, &member.ty, exports, true);
+                let ty = self.render_type(&owner, &member.ty, exports, true);
                 let docs = source.docs.iter().map(|line| quote::quote!(#[doc = #line]));
                 fields.push(quote::quote! {
                     #(#docs)*
@@ -1240,7 +1435,7 @@ impl<'a> Context<'a> {
                     // `offset_of!` cannot be used on a slice. The padding before
                     // it is explicit, so Rust only has to not add any more.
                     Ty::RuntimeArray(element) => {
-                        let element = self.render_type(export, element, exports, true);
+                        let element = self.render_type(&owner, element, exports, true);
                         quote::quote! {
                             ::core::assert!(#offset % ::core::mem::align_of::<#element>() == 0, #message);
                             ::core::assert!(::core::mem::size_of::<#element>() == #size, #message);
@@ -1311,11 +1506,11 @@ impl<'a> Context<'a> {
             }
         } else {
             let mut fields = Vec::new();
-            let mut last = None;
+            let mut unsized_last = false;
             for member in &export.members {
                 let ty = self.tree_type(&export.key, &member.ty);
-                let rendered = self.render_type(export, &ty, exports, false);
-                last = Some(ty);
+                let rendered = self.render_type(&owner, &ty, exports, false);
+                unsized_last = self.is_unsized(&ty);
                 let field = rust_ident(&member.name);
                 let docs = member.docs.iter().map(|line| quote::quote!(#[doc = #line]));
                 fields.push(quote::quote! {
@@ -1325,7 +1520,7 @@ impl<'a> Context<'a> {
             }
 
             // Structs with slices at the end cannot be copied.
-            let derives = if matches!(last, Some(Ty::RuntimeArray(_))) {
+            let derives = if unsized_last {
                 quote::quote!(::core::fmt::Debug)
             } else {
                 quote::quote!(
@@ -1379,6 +1574,72 @@ fn const_value(module: &Module, expression: Handle<naga::Expression>) -> Option<
         }
         _ => None,
     }
+}
+
+/// The item that a type is being generated for, which is used for paths
+/// and error messages.
+struct Owner<'a> {
+    /// The module that the item is declared in.
+    module: &'a ModulePath,
+    /// The path of the item from the package root.
+    key: &'a str,
+}
+
+impl ExportedStruct {
+    /// The details of this struct that are needed to render types.
+    fn owner(&self) -> Owner<'_> {
+        Owner {
+            module: &self.module,
+            key: &self.key,
+        }
+    }
+}
+
+impl ExportedAlias {
+    /// The details of this alias that are needed to render types.
+    fn owner(&self) -> Owner<'_> {
+        Owner {
+            module: &self.module,
+            key: &self.key,
+        }
+    }
+}
+
+/// Finds the exported struct with the path `key`, which `owner` refers to.
+/// Stops compilation if there is none.
+fn find_export<'a>(owner: &Owner, exports: &'a [ExportedStruct], key: &str) -> &'a ExportedStruct {
+    exports
+        .iter()
+        .find(|export| export.key == key)
+        .unwrap_or_else(|| {
+            fail_in(
+                owner.key,
+                format!(
+                    "`{key}` is not exported; mark it `@export`, or add an entry for it to the `external_types` option"
+                ),
+            )
+        })
+}
+
+/// The shortest Rust path from the module of `owner` to the item called `name`
+/// in `target_module`.
+fn item_path(owner: &Owner, target_module: &ModulePath, name: &str) -> proc_macro2::TokenStream {
+    let module = &owner.module.components;
+    let target_module = &target_module.components;
+    let shared = module
+        .iter()
+        .zip(target_module)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut path = vec![if shared == module.len() {
+        quote::format_ident!("self")
+    } else {
+        quote::format_ident!("super")
+    }];
+    path.extend((shared + 1..module.len()).map(|_| quote::format_ident!("super")));
+    path.extend(target_module[shared..].iter().map(|c| rust_ident(c)));
+    path.push(rust_ident(name));
+    quote::quote!(#(#path)::*)
 }
 
 /// Stops compilation with an error about the exported item `owner`.
@@ -1603,7 +1864,7 @@ mod tests {
     /// The attribute only makes sense on structs.
     #[test]
     #[should_panic(
-        expected = "can only be applied to structs and constants, but it is on a function"
+        expected = "can only be applied to structs, constants and type aliases, but it is on a function"
     )]
     fn test_export_rejects_functions() {
         generate_package("function", &[("package.wesl", "@export fn f() {}")], &[]);
@@ -1612,7 +1873,7 @@ mod tests {
     /// Members cannot be exported either.
     #[test]
     #[should_panic(
-        expected = "can only be applied to structs and constants (found 1 on something else)"
+        expected = "can only be applied to structs, constants and type aliases (found 1 on something else)"
     )]
     fn test_export_rejects_members() {
         generate_package(
@@ -1620,6 +1881,204 @@ mod tests {
             &[("package.wesl", "@export struct A { @export x: u32 }")],
             &[],
         );
+    }
+
+    /// Exported aliases become Rust type aliases for their targets.
+    #[test]
+    fn test_exported_aliases_are_type_aliases() {
+        let source = "
+            alias Plain = u32;
+            /// A color.
+            @export alias Color = vec3f;
+            @export alias Count = Plain;
+            @export alias Grid = array<vec2u, 4>;
+            @export alias Transform = mat4x4f;
+        ";
+        let output = generate_package("aliases", &[("package.wesl", source)], &[]);
+        assert!(
+            output.contains("pub type Color = :: include_wesl :: glam :: Vec3 ;"),
+            "{output}"
+        );
+        assert!(output.contains("# [doc = \"A color.\"]"), "{output}");
+        assert!(output.contains("pub type Count = u32 ;"), "{output}");
+        assert!(
+            output.contains("pub type Grid = [:: include_wesl :: glam :: UVec2 ; 4usize] ;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub type Transform = :: include_wesl :: glam :: Mat4 ;"),
+            "{output}"
+        );
+        assert!(!output.contains("Plain"), "{output}");
+    }
+
+    /// Aliases follow the type of vectors and matrices.
+    #[test]
+    fn test_exported_aliases_use_glam() {
+        let output = generate_package(
+            "alias_glam",
+            &[("package.wesl", "@export alias Color = vec3f;")],
+            &[],
+        );
+        assert!(
+            output.contains("pub type Color = :: include_wesl :: glam :: Vec3 ;"),
+            "{output}"
+        );
+    }
+
+    /// An alias for an exported struct names the generated struct.
+    #[test]
+    fn test_aliases_of_structs() {
+        let source = "@export struct A { x: u32 }\n@export alias B = A;";
+        let output = generate_package("alias_struct", &[("package.wesl", source)], &[]);
+        assert!(output.contains("pub type B = self :: A ;"), "{output}");
+    }
+
+    /// An alias for a struct that is not exported has nothing to refer to.
+    #[test]
+    #[should_panic(expected = "`A` is not exported")]
+    fn test_aliases_of_private_structs_are_reported() {
+        let source = "struct A { x: u32 }\n@export alias B = A;";
+        generate_package("alias_private", &[("package.wesl", source)], &[]);
+    }
+
+    /// Plain structs refer to exported aliases by name, and the other aliases
+    /// are still replaced by their targets.
+    #[test]
+    fn test_plain_structs_refer_to_exported_aliases() {
+        let source = "
+            alias Plain = u32;
+            @export alias Id = u32;
+            @export struct A { id: Id, plain: Plain, b: bool }
+        ";
+        let output = generate_package("alias_field", &[("package.wesl", source)], &[]);
+        assert!(output.contains("pub id : self :: Id"), "{output}");
+        assert!(output.contains("pub plain : u32"), "{output}");
+    }
+
+    /// Blittable structs get their field types from the compiled shader, so
+    /// they write the target of an exported alias.
+    #[test]
+    fn test_blittable_structs_spell_out_exported_aliases() {
+        let source = "@export alias Id = u32;\n@export struct A { id: Id }";
+        let output = generate_package("alias_pod", &[("package.wesl", source)], &[]);
+        assert!(output.contains("Pod"), "{output}");
+        assert!(output.contains("pub id : u32"), "{output}");
+        assert!(output.contains("pub type Id = u32 ;"), "{output}");
+    }
+
+    /// An exported alias of a runtime-sized array still makes the struct that
+    /// ends in it dynamically sized.
+    #[test]
+    fn test_exported_runtime_array_aliases_are_unsized() {
+        let source = "
+            @export alias List = array<u32>;
+            @export struct A { b: bool, items: List }
+        ";
+        let output = generate_package("alias_unsized", &[("package.wesl", source)], &[]);
+        assert!(output.contains("pub type List = [u32] ;"), "{output}");
+        assert!(output.contains("pub items : self :: List"), "{output}");
+        assert!(!output.contains("Copy"), "{output}");
+    }
+
+    /// Aliases that refer to other exported aliases keep the names.
+    #[test]
+    fn test_exported_aliases_of_exported_aliases() {
+        let source = "@export alias A = u32;\n@export alias B = array<A, 2>;";
+        let output = generate_package("alias_chain", &[("package.wesl", source)], &[]);
+        assert!(
+            output.contains("pub type B = [self :: A ; 2usize] ;"),
+            "{output}"
+        );
+    }
+
+    /// An alias that the caller replaces is not generated, and its users get
+    /// the replacement.
+    #[test]
+    fn test_replaced_exported_aliases_are_not_generated() {
+        let source = "@export alias Id = u32;\n@export struct A { id: Id, b: bool }";
+        let output = generate_package(
+            "alias_replaced",
+            &[("package.wesl", source)],
+            &[("Id", syn::parse_quote!(crate::Id))],
+        );
+        assert!(!output.contains("pub type Id"), "{output}");
+        assert!(output.contains("pub id : crate :: Id"), "{output}");
+    }
+
+    /// Conditional aliases have no single Rust type, unless the caller gives
+    /// one.
+    #[test]
+    #[should_panic(expected = "conditional translation on exported type aliases")]
+    fn test_conditional_exported_aliases_are_rejected() {
+        let source = "
+            @if(half) enable f16;
+            @if(half) @export alias M = f16;
+            @if(!half) @export alias M = f32;
+        ";
+        generate_package("alias_conditional", &[("package.wesl", source)], &[]);
+    }
+
+    /// A conditional alias is allowed if the caller replaces it.
+    #[test]
+    fn test_conditional_exported_aliases_can_be_replaced() {
+        let source = "
+            @if(half) enable f16;
+            @if(half) @export alias M = f16;
+            @if(!half) @export alias M = f32;
+            @export struct A { x: M, b: bool }
+        ";
+        let output = generate_package(
+            "alias_conditional_replaced",
+            &[("package.wesl", source)],
+            &[("M", syn::parse_quote!(f32))],
+        );
+        assert!(!output.contains("pub type M"), "{output}");
+        assert!(output.contains("pub x : f32"), "{output}");
+    }
+
+    /// Array lengths can name constants, which are evaluated from the syntax
+    /// tree, since type aliases do not survive compilation.
+    #[test]
+    fn test_array_lengths_can_be_constants() {
+        let source = "
+            @export const LODS: u32 = 8u;
+            const BASE = 2;
+            const DOUBLE: u32 = u32(BASE) * 2u + (LODS - 6u) % 4u;
+            @export alias Counts = array<u32, LODS>;
+            @export alias Table = array<vec2f, DOUBLE>;
+            @export struct A { counts: Counts, flat: array<f32, LODS / 2u>, b: bool }
+        ";
+        let output = generate_package("alias_lengths", &[("package.wesl", source)], &[]);
+        assert!(
+            output.contains("pub type Counts = [u32 ; 8usize] ;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub type Table = [:: include_wesl :: glam :: Vec2 ; 6usize] ;"),
+            "{output}"
+        );
+        assert!(output.contains("pub flat : [f32 ; 4usize]"), "{output}");
+    }
+
+    /// A constant that is declared conditionally has no single length.
+    #[test]
+    #[should_panic(expected = "`N` is declared conditionally")]
+    fn test_conditional_array_lengths_are_reported() {
+        let source = "
+            @if(big) const N: u32 = 8u;
+            @if(!big) const N: u32 = 4u;
+            @export alias Counts = array<u32, N>;
+        ";
+        generate_package("alias_length_conditional", &[("package.wesl", source)], &[]);
+    }
+
+    /// Only constants can be array lengths.
+    #[test]
+    #[should_panic(expected = "`N` is not a constant")]
+    fn test_overrides_are_not_array_lengths() {
+        let source = "override N: u32 = 8u;\n@export alias Counts = array<u32, N>;";
+        generate_package("alias_length_override", &[("package.wesl", source)], &[]);
     }
 
     /// Types without a `glam` equivalent are arrays even in `glam` mode.

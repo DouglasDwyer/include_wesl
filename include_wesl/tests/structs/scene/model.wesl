@@ -93,6 +93,29 @@ alias Handles = array<Handle>;
     ids: array<u32>
 }
 
+/// A position, which is a vector in Rust.
+@export alias Position = vec3f;
+
+/// A fixed-size list of words.
+@export alias Words = array<u32, 4>;
+
+/// A list as long as an exported constant.
+@export alias BrickWords = array<u32, BRICK_VOLUME>;
+
+/// Another name for an exported struct.
+@export alias Extent = Bounds;
+
+/// A runtime-sized list of words.
+@export alias WordList = array<u32>;
+
+/// Not blittable, so it refers to the exported aliases by name.
+@export struct Tagged {
+    enabled: bool,
+    position: Position,
+    words: Words,
+    list: WordList
+}
+
 /// Gives the main module something to use, so that this module is loaded.
 fn touch() {
 }
