@@ -230,13 +230,16 @@ fn consts_are_usable_in_const_contexts() {
 /// their targets.
 #[test]
 fn aliases_are_interchangeable_with_their_targets() {
-    use scene::model::{Bounds, Extent, Position, Words};
+    use scene::model::{BRICK_VOLUME, Bounds, BrickWords, Extent, Position, Words};
 
     let position: Position = ::include_wesl::glam::Vec3::new(1.0, 2.0, 3.0);
     assert_eq!(position.y, 2.0);
 
     let words: Words = [1, 2, 3, 4];
     assert_eq!(words.iter().sum::<u32>(), 10);
+
+    let bricks: BrickWords = [0; BRICK_VOLUME as usize];
+    assert_eq!(bricks.len(), 64);
 
     let extent: Extent = Bounds::default();
     assert_eq!(size_of::<Extent>(), size_of::<Bounds>());
