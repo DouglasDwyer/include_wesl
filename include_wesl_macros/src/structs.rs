@@ -42,6 +42,11 @@
 // gives its Rust type). Fields of plain structs that use an exported alias
 // refer to it by name. Blittable structs take their field types from Naga,
 // which no longer knows about aliases, so they spell out the target.
+//
+// Array lengths in the syntax tree are integer literals or the names of
+// constants. The value of a constant is read from Naga, so it must be the same
+// in every feature variant of the shader, and (as above) it must not be of an
+// abstract type.
 
 use super::*;
 use syn::parse::*;
@@ -454,6 +459,8 @@ impl PodLayout {
 
 /// Information about the shader package that all of the conversion code needs.
 struct Context<'a> {
+    /// The path to the shaders.
+    shader_path: &'a Path,
     /// The unevaluated compilation.
     compilation: &'a CompileResult,
     /// From the mangled name of an item to its module and original name.
@@ -466,6 +473,9 @@ struct Context<'a> {
     /// The exported type aliases, by their path from the package root. These
     /// are filled in after the exports have been collected.
     exported_aliases: HashMap<String, ExportedAlias>,
+    /// Every variant of the shader, compiled the first time that they are
+    /// needed.
+    variants: std::cell::OnceCell<Vec<Module>>,
     /// The caller's options.
     options: &'a Options,
 }
@@ -475,7 +485,7 @@ struct Context<'a> {
 pub fn generate(shader_path: &Path, options: &Options) -> (proc_macro2::TokenStream, Vec<PathBuf>) {
     let compilation = compile_unevaluated(shader_path);
     let files = source_files(&compilation);
-    let mut context = Context::new(&compilation, options);
+    let mut context = Context::new(shader_path, &compilation, options);
     let exports = context.collect_exports();
     context.exported_aliases = exports
         .aliases
@@ -484,15 +494,15 @@ pub fn generate(shader_path: &Path, options: &Options) -> (proc_macro2::TokenStr
         .collect();
 
     // Every variant of the shader is needed to check that the exported items
-    // agree between them. Aliases come from the syntax tree, so they do not
-    // need the variants.
+    // agree between them. Aliases come from the syntax tree, so they only need
+    // the variants to read the constants that are array lengths.
     let modules = if exports.structs.is_empty() && exports.consts.is_empty() {
-        Vec::new()
+        &[]
     } else {
-        compile_variants(shader_path, &collect_features(&compilation))
+        context.variants()
     };
-    let layouts = context.blittable_layouts(&modules, &exports.structs);
-    let values = context.const_values(&modules, &exports.consts);
+    let layouts = context.blittable_layouts(modules, &exports.structs);
+    let values = context.const_values(modules, &exports.consts);
 
     let mut root = ModuleNode::default();
     for export in &exports.structs {
@@ -607,7 +617,7 @@ impl ModuleNode {
 
 impl<'a> Context<'a> {
     /// Gathers the information used to resolve names.
-    fn new(compilation: &'a CompileResult, options: &'a Options) -> Self {
+    fn new(shader_path: &'a Path, compilation: &'a CompileResult, options: &'a Options) -> Self {
         let items: HashMap<_, _> = compilation
             .sourcemap()
             .expect("source map not generated")
@@ -643,11 +653,13 @@ impl<'a> Context<'a> {
         }
 
         Self {
+            shader_path,
             compilation,
             items,
             unmangled,
             aliases,
             exported_aliases: HashMap::new(),
+            variants: std::cell::OnceCell::new(),
             options,
         }
     }
@@ -973,21 +985,54 @@ impl<'a> Context<'a> {
                 return Ty::RuntimeArray(Box::new(element));
             }
 
-            let length = match args.get(1).map(|arg| &*arg.expression) {
-                Some(wesl::syntax::Expression::Literal(LiteralExpression::AbstractInt(n))) => {
-                    *n as u32
-                }
-                Some(wesl::syntax::Expression::Literal(LiteralExpression::U32(n))) => *n,
-                Some(wesl::syntax::Expression::Literal(LiteralExpression::I32(n))) => *n as u32,
-                _ => fail_in(
-                    owner,
-                    "array lengths in structs that are not blittable must be integer literals",
-                ),
-            };
+            let length = self.tree_length(owner, &args[1].expression);
             return Ty::Array(Box::new(element), length);
         }
 
         fail_in(owner, format!("the type `{name}` has no Rust equivalent"))
+    }
+
+    /// Every variant of the shader.
+    fn variants(&self) -> &[Module] {
+        self.variants
+            .get_or_init(|| compile_variants(self.shader_path, &collect_features(self.compilation)))
+    }
+
+    /// Determines the length of an array in a type from the syntax tree, where
+    /// `expression` is an integer literal or the name of a constant. `owner` is
+    /// the exported item that the array is part of.
+    fn tree_length(&self, owner: &str, expression: &wesl::syntax::Expression) -> u32 {
+        use wesl::syntax::Expression;
+
+        let length = match expression {
+            Expression::Literal(LiteralExpression::AbstractInt(n)) => *n,
+            Expression::Literal(LiteralExpression::U32(n)) => i64::from(*n),
+            Expression::Literal(LiteralExpression::I32(n)) => i64::from(*n),
+            Expression::TypeOrIdentifier(constant) if constant.template_args.is_none() => {
+                let mangled = constant.ident.name().to_string();
+                let name = self.original_name(&mangled);
+                match constant_value(self.variants(), &mangled) {
+                    Ok(Lit::U32(n)) => i64::from(n),
+                    Ok(Lit::I32(n)) => i64::from(n),
+                    // The compiler already rejects other types of length.
+                    Ok(_) => fail_in(
+                        owner,
+                        format!("the array length `{name}` is not a `u32` or `i32` constant"),
+                    ),
+                    Err(reason) => fail_in(
+                        owner,
+                        format!("the array length `{name}` cannot be read: {reason}"),
+                    ),
+                }
+            }
+            _ => fail_in(
+                owner,
+                "array lengths in types that are not blittable must be integer literals or constants",
+            ),
+        };
+
+        u32::try_from(length)
+            .unwrap_or_else(|_| fail_in(owner, format!("{length} is not a valid array length")))
     }
 
     /// Determines the Rust type that Naga's `ty` corresponds to. Returns `None`
@@ -1125,45 +1170,14 @@ impl<'a> Context<'a> {
     ///
     /// The result is keyed by the name of the constant in the compiled shader.
     fn const_values(&self, modules: &[Module], exports: &[ExportedConst]) -> HashMap<String, Lit> {
-        let mut result = HashMap::<String, Lit>::new();
-
-        for module in modules {
-            for export in exports {
-                let Some(handle) = find_constant(module, &export.mangled) else {
-                    continue;
-                };
-
-                let Some(value) = const_value(module, module.constants[handle].init) else {
-                    fail_in(
-                        &export.key,
-                        "only constants of a scalar type (`bool`, `i32`, `u32`, `f32`, `f16`, `i64`, `u64` or `f64`) can be exported",
-                    );
-                };
-
-                match result.get(&export.mangled) {
-                    None => {
-                        result.insert(export.mangled.clone(), value);
-                    }
-                    Some(first) if *first != value => fail_in(
-                        &export.key,
-                        "the constant has a different value or type in different variants of the shader, so it has no single Rust value",
-                    ),
-                    Some(_) => {}
-                }
-            }
-        }
-
-        if let Some(export) = exports
+        exports
             .iter()
-            .find(|export| !result.contains_key(&export.mangled))
-        {
-            fail_in(
-                &export.key,
-                "the constant was not found in any variant of the compiled shader; constants of an abstract type, like `const A = 1;`, are not kept by the compiler, so give it a type (`const A: u32 = 1;`)",
-            );
-        }
-
-        result
+            .map(|export| {
+                let value = constant_value(modules, &export.mangled)
+                    .unwrap_or_else(|reason| fail_in(&export.key, reason));
+                (export.mangled.clone(), value)
+            })
+            .collect()
     }
 
     /// Reads the layout of an exported struct out of a compiled shader.
@@ -1462,6 +1476,32 @@ fn find_struct(module: &Module, mangled: &str) -> Option<Handle<Type>> {
             ty.name.as_deref() == Some(mangled) && matches!(ty.inner, TypeInner::Struct { .. })
         })
         .map(|(handle, _)| handle)
+}
+
+/// Reads the value of the scalar constant called `mangled` from every variant
+/// of the shader that defines it. On failure, returns the reason.
+fn constant_value(modules: &[Module], mangled: &str) -> std::result::Result<Lit, String> {
+    let mut result = None;
+
+    for module in modules {
+        let Some(handle) = find_constant(module, mangled) else {
+            continue;
+        };
+
+        let Some(value) = const_value(module, module.constants[handle].init) else {
+            return Err("only constants of a scalar type (`bool`, `i32`, `u32`, `f32`, `f16`, `i64`, `u64` or `f64`) are supported".into());
+        };
+
+        match result {
+            None => result = Some(value),
+            Some(first) if first != value => {
+                return Err("the constant has a different value or type in different variants of the shader, so it has no single value".into());
+            }
+            Some(_) => {}
+        }
+    }
+
+    result.ok_or_else(|| "the constant was not found in any variant of the compiled shader; constants of an abstract type, like `const A = 1;`, are not kept by the compiler, so give it a type (`const A: u32 = 1;`)".into())
 }
 
 /// Finds the constant called `mangled` in a compiled shader. Returns `None` if
@@ -1945,6 +1985,51 @@ mod tests {
         );
         assert!(!output.contains("pub type M"), "{output}");
         assert!(output.contains("pub x : f32"), "{output}");
+    }
+
+    /// Array lengths can name constants, whose values come from Naga, since
+    /// type aliases do not survive compilation.
+    #[test]
+    fn test_array_lengths_can_be_constants() {
+        let source = "
+            @export const LODS: u32 = 8u;
+            const DOUBLE: i32 = i32(LODS) * 2;
+            @export alias Counts = array<u32, LODS>;
+            @export alias Table = array<vec2f, DOUBLE>;
+            @export struct A { counts: Counts, flat: array<f32, LODS>, b: bool }
+        ";
+        let output = generate_package("alias_lengths", &[("package.wesl", source)], &[]);
+        assert!(
+            output.contains("pub type Counts = [u32 ; 8usize] ;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("pub type Table = [:: include_wesl :: glam :: Vec2 ; 16usize] ;"),
+            "{output}"
+        );
+        assert!(output.contains("pub flat : [f32 ; 8usize]"), "{output}");
+    }
+
+    /// Constants of an abstract type are not kept by the compiler, so they
+    /// cannot be array lengths.
+    #[test]
+    #[should_panic(expected = "the array length `N` cannot be read")]
+    fn test_abstract_array_lengths_are_reported() {
+        let source = "const N = 8;\n@export alias Counts = array<u32, N>;";
+        generate_package("alias_length_abstract", &[("package.wesl", source)], &[]);
+    }
+
+    /// A constant with a different value in different variants has no single
+    /// length.
+    #[test]
+    #[should_panic(expected = "different value or type in different variants")]
+    fn test_variant_dependent_array_lengths_are_reported() {
+        let source = "
+            @if(big) const N: u32 = 8u;
+            @if(!big) const N: u32 = 4u;
+            @export alias Counts = array<u32, N>;
+        ";
+        generate_package("alias_length_variants", &[("package.wesl", source)], &[]);
     }
 
     /// Types without a `glam` equivalent are arrays even in `glam` mode.
@@ -2449,7 +2534,7 @@ mod tests {
 
     /// Constants that are not scalars are not supported yet.
     #[test]
-    #[should_panic(expected = "can be exported")]
+    #[should_panic(expected = "are supported")]
     fn test_non_scalar_consts_are_rejected() {
         generate_package(
             "non_scalar",

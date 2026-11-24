@@ -99,6 +99,9 @@ alias Handles = array<Handle>;
 /// A fixed-size list of words.
 @export alias Words = array<u32, 4>;
 
+/// A list as long as an exported constant.
+@export alias BrickWords = array<u32, BRICK_VOLUME>;
+
 /// Another name for an exported struct.
 @export alias Extent = Bounds;
 
