@@ -225,3 +225,32 @@ fn consts_are_usable_in_const_contexts() {
     const WORDS: [u32; BRICK_VOLUME as usize] = [0; BRICK_VOLUME as usize];
     assert_eq!(WORDS.len(), 64);
 }
+
+/// Exported aliases are Rust type aliases, so they are interchangeable with
+/// their targets.
+#[test]
+fn aliases_are_interchangeable_with_their_targets() {
+    use scene::model::{Bounds, Extent, Position, Words};
+
+    let position: Position = ::include_wesl::glam::Vec3::new(1.0, 2.0, 3.0);
+    assert_eq!(position.y, 2.0);
+
+    let words: Words = [1, 2, 3, 4];
+    assert_eq!(words.iter().sum::<u32>(), 10);
+
+    let extent: Extent = Bounds::default();
+    assert_eq!(size_of::<Extent>(), size_of::<Bounds>());
+    assert_eq!(bytes_of(&extent), bytes_of(&Bounds::default()));
+}
+
+/// Plain structs name the exported aliases of their fields, and an alias of an
+/// unsized array makes the struct unsized.
+#[test]
+fn plain_structs_refer_to_aliases() {
+    use scene::model::{Position, Tagged, WordList, Words};
+
+    fn takes_tagged(tagged: &Tagged) -> (bool, Position, Words, &WordList) {
+        (tagged.enabled, tagged.position, tagged.words, &tagged.list)
+    }
+    let _ = takes_tagged;
+}
